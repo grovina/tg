@@ -1,0 +1,13 @@
+# tg.conf — non-secret, repo-local config. Copy to `tg.conf` and edit.
+# Read at the repo root (the dir holding tg.conf / var/telegram / .git).
+# Secrets do NOT go here — see README (TG_BOT_TOKEN, TG_ELEVENLABS_KEY via env).
+
+# Chat registry. GROUP is the default `send` target; UPPERCASE names are
+# aliases resolvable by `--to <name>`. Find ids with `tg ids` after polling.
+GROUP=-1001234567890
+ALICE=10000001
+
+# Behavior (all optional)
+TG_TRANSCRIBE_LANG=pt              # omit for auto-detect (multilingual groups)
+TG_WATCHED_CHATS=-1001234567890    # comma-separated; restrict `watch` to these chats
+TG_ELEVENLABS_VOICE_ID=            # only for sendvoice (TTS)
