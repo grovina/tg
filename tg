@@ -21,11 +21,16 @@ Commands:
   poll                       long-poll daemon (pid-guarded singleton, idempotent)
   doctor                     (re)start the poller detached if dead
   watch                      doctor + watchdog + follow history.jsonl -> Monitor stream
-  send [opts] <text>         sendMessage  (--to <name|id> --topic <name>|--topic-id <n> --html --dry-run)
-  sendvoice <text> [chat]    ElevenLabs TTS -> opus -> sendVoice
-  senddoc <path> [opts]      sendDocument (--to --caption --topic ...)
-  react <msg_id> [emoji]     setMessageReaction  (--to; empty emoji clears)
-  delete [--to] <msg_id>     deleteMessage + synthetic 'deleted' history row
+  send <text> [to]           sendMessage   (+ --topic <name>|--topic-id <n> --html --dry-run)
+  sendvoice <text> [to]      ElevenLabs TTS -> opus -> sendVoice
+  senddoc <path> [to]        sendDocument — file attachment (+ --caption --topic …)
+  sendphoto <path> [to]      sendPhoto — inline image    (+ --caption --html --topic …)
+  react <msg_id> [emoji] [to]  setMessageReaction (empty emoji clears reaction)
+  reactions [to]             list the emoji this chat actually allows as reactions
+  delete <msg_id> [to]       deleteMessage + synthetic 'deleted' history row
+
+The target chat [to] is a uniform optional TRAILING positional — a tg.conf alias
+or a numeric id; omit it for the group. (--to still works as a legacy alias.)
   media                      idempotent backfill: download media + Scribe-transcribe
   ids                        print chat ids seen in history
   topics [list|set <name> <id>|rm <name>|resolve <name>]
@@ -570,6 +575,13 @@ def _log_out(ctx, chat, result, extra=None):
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _to(a):
+    """Target chat name: the trailing positional, else the legacy --to alias,
+    else 'group'. One rule for every outbound command so a model never has to
+    recall which take a flag vs a positional."""
+    return getattr(a, "to", None) or getattr(a, "to_flag", None) or "group"
+
+
 def _thread_for(ctx, topic_name, topic_id):
     if topic_id and topic_name:
         die("pass only one of --topic / --topic-id", 2)
@@ -586,7 +598,7 @@ def _thread_for(ctx, topic_name, topic_id):
 
 
 def cmd_send(ctx, a):
-    to = ctx.resolve_chat(a.to or "group")
+    to = ctx.resolve_chat(_to(a))
     if not to:
         die("send: no target. Set GROUP in tg.conf or pass --to <id>.", 2)
     thread = _thread_for(ctx, a.topic, a.topic_id)
@@ -606,7 +618,7 @@ def cmd_send(ctx, a):
 
 
 def cmd_sendvoice(ctx, a):
-    to = ctx.resolve_chat(a.to or "group")
+    to = ctx.resolve_chat(_to(a))
     if not to:
         die("sendvoice: no target chat", 2)
     if not _which("ffmpeg"):
@@ -635,7 +647,7 @@ def cmd_sendvoice(ctx, a):
 
 
 def cmd_senddoc(ctx, a):
-    to = ctx.resolve_chat(a.to or "group")
+    to = ctx.resolve_chat(_to(a))
     if not to:
         die("senddoc: no target chat", 2)
     if not os.path.exists(a.path):
@@ -656,18 +668,81 @@ def cmd_senddoc(ctx, a):
     print("ok doc msg %s" % j["result"].get("message_id"))
 
 
+def cmd_sendphoto(ctx, a):
+    to = ctx.resolve_chat(_to(a))
+    if not to:
+        die("sendphoto: no target chat", 2)
+    if not os.path.exists(a.path):
+        die("sendphoto: no such file: %s" % a.path, 2)
+    thread = _thread_for(ctx, a.topic, a.topic_id)
+    fields = {"chat_id": to}
+    if a.caption:
+        fields["caption"] = a.caption
+        if a.html:
+            fields["parse_mode"] = "HTML"
+    if thread:
+        fields["message_thread_id"] = thread
+    with open(a.path, "rb") as f:
+        ctype = mimetypes.guess_type(a.path)[0] or "image/jpeg"
+        j = api_post_multipart(ctx, "sendPhoto", fields,
+                               {"photo": (os.path.basename(a.path), f.read(), ctype)})
+    if not j.get("ok"):
+        die("sendPhoto failed: %s" % j.get("description"))
+    _log_out(ctx, to, j["result"])
+    print("ok photo msg %s" % j["result"].get("message_id"))
+
+
+# Telegram's global default reaction set (Bot API). A chat's admins may narrow
+# it; `tg reactions` reports the chat's actual allowance via getChat.
+_DEFAULT_REACTIONS = (
+    "👍 👎 ❤️ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤️‍🔥 "
+    "🌚 🌭 💯 🤣 ⚡️ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 "
+    "✍️ 🤗 🫡 🎅 🎄 ☃️ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂️ 🤷 🤷‍♀️ 😡"
+)
+
+
+def cmd_reactions(ctx, a):
+    to = ctx.resolve_chat(_to(a))
+    if not to:
+        die("reactions: no target chat", 2)
+    j = api_get(ctx, "getChat", {"chat_id": to})
+    if not j.get("ok"):
+        die("getChat failed: %s" % j.get("description"))
+    av = j["result"].get("available_reactions")
+    if av is None:
+        # Field absent ⇒ the chat allows Telegram's full default set.
+        print("all default reactions allowed in this chat:")
+        print("  " + _DEFAULT_REACTIONS)
+        return
+    emojis = [r.get("emoji") for r in av if r.get("type") == "emoji" and r.get("emoji")]
+    customs = sum(1 for r in av if r.get("type") == "custom_emoji")
+    if emojis:
+        print("reactions allowed in this chat (%d):" % len(emojis))
+        print("  " + " ".join(emojis))
+    elif not customs:
+        print("this chat allows no reactions")
+    if customs:
+        print("+ %d custom-emoji reaction(s) (need a custom_emoji_id, not plain emoji)" % customs)
+
+
 def cmd_react(ctx, a):
-    to = ctx.resolve_chat(a.to or "group")
+    to = ctx.resolve_chat(_to(a))
     if not to:
         die("react: no target chat", 2)
     reaction = [] if not a.emoji else [{"type": "emoji", "emoji": a.emoji}]
     j = api_post(ctx, "setMessageReaction",
                  {"chat_id": to, "message_id": a.msg_id, "reaction": json.dumps(reaction)})
-    print("ok" if j.get("ok") else "err: %s" % j.get("description"))
+    if not j.get("ok"):
+        # Telegram rejects any emoji outside this chat's allowed set (a fixed
+        # global list, optionally narrowed by the group's admins) — `tg
+        # reactions` prints what's actually permitted here.
+        die("react failed: %s — run `tg reactions` to list emoji this chat allows"
+            % j.get("description"))
+    print("ok")
 
 
 def cmd_delete(ctx, a):
-    to = ctx.resolve_chat(a.to or "group")
+    to = ctx.resolve_chat(_to(a))
     if not to:
         die("delete: no target chat", 2)
     j = api_post(ctx, "deleteMessage", {"chat_id": to, "message_id": a.msg_id})
@@ -746,17 +821,28 @@ def build_parser():
     sub.add_parser("poll"); sub.add_parser("doctor"); sub.add_parser("watch")
     sub.add_parser("media"); sub.add_parser("ids")
 
-    s = sub.add_parser("send"); s.add_argument("text")
-    s.add_argument("--to"); s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
+    # The target chat is a uniform optional TRAILING positional, defaulting to
+    # the group; `--to` stays as a hidden legacy alias (see _to()).
+    def add_to(s):
+        s.add_argument("to", nargs="?", help="target chat (tg.conf alias or id); omit for the group")
+        s.add_argument("--to", dest="to_flag", help=argparse.SUPPRESS)
+
+    s = sub.add_parser("send"); s.add_argument("text"); add_to(s)
+    s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
     s.add_argument("--html", action="store_true"); s.add_argument("--dry-run", dest="dry_run", action="store_true")
 
-    s = sub.add_parser("sendvoice"); s.add_argument("text"); s.add_argument("to", nargs="?")
+    s = sub.add_parser("sendvoice"); s.add_argument("text"); add_to(s)
 
-    s = sub.add_parser("senddoc"); s.add_argument("path")
-    s.add_argument("--to"); s.add_argument("--caption"); s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
+    s = sub.add_parser("senddoc"); s.add_argument("path"); add_to(s)
+    s.add_argument("--caption"); s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
 
-    s = sub.add_parser("react"); s.add_argument("msg_id"); s.add_argument("emoji", nargs="?"); s.add_argument("--to")
-    s = sub.add_parser("delete"); s.add_argument("msg_id"); s.add_argument("--to")
+    s = sub.add_parser("sendphoto"); s.add_argument("path"); add_to(s)
+    s.add_argument("--caption"); s.add_argument("--html", action="store_true")
+    s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
+
+    s = sub.add_parser("react"); s.add_argument("msg_id"); s.add_argument("emoji", nargs="?"); add_to(s)
+    s = sub.add_parser("reactions"); add_to(s)
+    s = sub.add_parser("delete"); s.add_argument("msg_id"); add_to(s)
 
     s = sub.add_parser("topics"); s.add_argument("sub", nargs="?"); s.add_argument("args", nargs="*")
     return p

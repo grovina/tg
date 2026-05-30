@@ -65,15 +65,34 @@ Config is read from `tg.conf` then `.env`, with environment variables winning.
 tg poll                          long-poll daemon (pid-guarded singleton, idempotent)
 tg doctor                        (re)start the poller detached if dead
 tg watch                         doctor + watchdog + follow history.jsonl → Monitor stream
-tg send [--to N|name] [--topic name|--topic-id N] [--html] [--dry-run] <text>
-tg sendvoice <text> [chat]       ElevenLabs TTS → opus → voice note
-tg senddoc <path> [--to] [--caption] [--topic …]
-tg react <msg_id> [emoji] [--to] empty emoji clears the reaction
-tg delete [--to] <msg_id>        deleteMessage + synthetic 'deleted' history row
+tg send <text> [to]              [--topic name|--topic-id N] [--html] [--dry-run]
+tg sendvoice <text> [to]         ElevenLabs TTS → opus → voice note
+tg senddoc <path> [to]           file attachment   [--caption] [--topic …]
+tg sendphoto <path> [to]         inline image      [--caption] [--html] [--topic …]
+tg react <msg_id> [emoji] [to]   empty emoji clears the reaction
+tg reactions [to]                list the emoji this chat actually allows
+tg delete <msg_id> [to]          deleteMessage + synthetic 'deleted' history row
 tg media                         idempotent backfill: download media + Scribe-transcribe
 tg ids                           print chat ids seen in history
 tg topics [list|set <name> <id>|rm <name>|resolve <name>]
 ```
+
+**Target chat — one rule everywhere.** Every outbound command takes the chat as
+an **optional trailing positional** (`to`): a `tg.conf` alias (`ALICE`) or a
+numeric id; **omit it for the group** (`GROUP`). So `tg send "hi"` goes to the
+group and `tg send "hi" alice` to Alice — same shape for `react`, `senddoc`,
+`sendphoto`, `delete`. (`--to` still works as a legacy alias, but the positional
+is canonical.)
+
+**Reactions are a fixed set.** Telegram only lets a bot react with emoji from a
+global allowed list, which a group's admins can narrow further — you can't react
+with arbitrary emoji. `tg reactions [to]` prints what the target chat actually
+permits (via `getChat`), so pick from that list; a rejected `react` reports
+Telegram's reason.
+
+**Images:** `sendphoto` posts an *inline* image (with optional `--caption`);
+`senddoc` sends the same file as a *download attachment*. Pick by how you want it
+to appear.
 
 The poller is a singleton: the `poller.pid` owner wins, so two `tg poll`
 processes (or a host one racing a box one) never both consume `getUpdates`
