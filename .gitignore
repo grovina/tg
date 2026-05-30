@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# repo-local Telegram state never belongs in the tool repo
+var/
+.env
+tg.conf
