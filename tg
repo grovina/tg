@@ -448,25 +448,25 @@ def poller_alive(ctx):
         os.kill(int(p), 0)
     except (OSError, ValueError):
         return False
-    # An alive PID is necessary but not sufficient: a poller wedged in a dead
-    # long-poll socket stays alive forever (offset frozen). Require a fresh
-    # heartbeat too, so a hung poller reads as dead and gets restarted. Absent
-    # heartbeat (just-started, pre-first-beat) trusts the live PID.
+    # An alive PID is necessary but not sufficient: it can be a poller wedged in
+    # a dead long-poll socket (offset frozen forever), or a stale pidfile whose
+    # number got reused by an unrelated live process (e.g. the claude session) —
+    # the false-healthy trap. Require a fresh heartbeat too. A poller writes its
+    # beat *before* its pidfile (see cmd_poll), so a live owner always has one;
+    # therefore a missing or stale beat means "not a healthy poller" → dead.
     try:
-        if time.time() - os.path.getmtime(ctx.beat) > POLLER_DEAD_SECS:
-            return False
+        return time.time() - os.path.getmtime(ctx.beat) <= POLLER_DEAD_SECS
     except OSError:
-        pass
-    return True
+        return False
 
 
 def cmd_poll(ctx, _a):
     if poller_alive(ctx):
         print("poller already running (pid %s)" % _read(ctx.pid)); return
     mypid = os.getpid()
+    _beat(ctx)                       # beat before pidfile: a live owner always has a heartbeat
     with open(ctx.pid, "w") as f:
         f.write(str(mypid))
-    _beat(ctx)
 
     def _cleanup(*_):
         if _read(ctx.pid) == str(mypid):
