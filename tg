@@ -258,6 +258,70 @@ _SKIP = {"message_id", "from", "sender_chat", "chat", "date", "text", "caption",
          "forum_topic_closed", "forum_topic_reopened"}
 
 
+def _iso(ts):
+    return datetime.datetime.fromtimestamp(ts, datetime.UTC).isoformat() if ts else None
+
+
+def _who(d):
+    d = d or {}
+    return {"id": d.get("id"), "first_name": d.get("first_name") or d.get("title"),
+            "username": d.get("username")}
+
+
+def _chat(c):
+    c = c or {}
+    return {"id": c.get("id"), "type": c.get("type"), "title": c.get("title")}
+
+
+def _reactions(arr):
+    """A list of Telegram ReactionType objects -> a flat list of display strings."""
+    out = []
+    for x in arr or []:
+        t = (x or {}).get("type")
+        if t == "emoji":
+            out.append(x.get("emoji"))
+        elif t == "custom_emoji":
+            out.append("custom:%s" % x.get("custom_emoji_id"))
+        elif t == "paid":
+            out.append("⭐")
+    return out
+
+
+def _event_row(u):
+    """Non-message updates we ingest: reactions (who reacted, old/new sets) and
+    membership changes (my_chat_member / chat_member). Returns a row or None."""
+    mr = u.get("message_reaction")
+    if mr:
+        actor = mr.get("user") or mr.get("actor_chat")
+        return {"direction": "in", "kind": "reaction", "update_id": u["update_id"],
+                "message_id": mr.get("message_id"),
+                "date": mr.get("date"), "iso": _iso(mr.get("date")),
+                "chat": _chat(mr.get("chat")), "from": _who(actor),
+                "old": _reactions(mr.get("old_reaction")),
+                "new": _reactions(mr.get("new_reaction"))}
+    mrc = u.get("message_reaction_count")
+    if mrc:
+        counts = [{"emoji": (_reactions([rc.get("type")]) or [None])[0],
+                   "count": rc.get("total_count")}
+                  for rc in (mrc.get("reactions") or [])]
+        return {"direction": "in", "kind": "reaction_count", "update_id": u["update_id"],
+                "message_id": mrc.get("message_id"),
+                "date": mrc.get("date"), "iso": _iso(mrc.get("date")),
+                "chat": _chat(mrc.get("chat")), "counts": counts}
+    which = "my_chat_member" if u.get("my_chat_member") else \
+            ("chat_member" if u.get("chat_member") else None)
+    if which:
+        cm = u[which]
+        old, new = cm.get("old_chat_member") or {}, cm.get("new_chat_member") or {}
+        return {"direction": "in", "kind": "member", "update_id": u["update_id"],
+                "scope": "me" if which == "my_chat_member" else "other",
+                "date": cm.get("date"), "iso": _iso(cm.get("date")),
+                "chat": _chat(cm.get("chat")), "from": _who(cm.get("from")),
+                "user": _who(new.get("user") or old.get("user")),
+                "old_status": old.get("status"), "new_status": new.get("status")}
+    return None
+
+
 def ingest(ctx, body):
     """Parse a getUpdates response; append rows; persist offset. Returns True on ok."""
     try:
@@ -271,6 +335,9 @@ def ingest(ctx, body):
         maxid = u["update_id"]
         m = u.get("message") or u.get("edited_message")
         if not m:
+            ev = _event_row(u)        # reaction / membership updates
+            if ev:
+                rows.append(ev)
             continue
         ch, fr = m.get("chat") or {}, m.get("from") or {}
         text = m.get("text") or m.get("caption")
@@ -432,6 +499,18 @@ def fetch_media(ctx):
 POLL_STALL_SECS = 90
 POLLER_DEAD_SECS = 150
 
+# Opt into reaction + membership updates. allowed_updates REPLACES Telegram's
+# default set (it doesn't add to it), so the message types we still want must be
+# listed too. message_reaction / message_reaction_count / chat_member are NOT in
+# the default set — without this they never arrive. Caveat: a *user's* reaction
+# (message_reaction) only reaches a bot that is an admin in the group; otherwise
+# just the anonymous message_reaction_count aggregate is delivered.
+_ALLOWED_UPDATES = json.dumps([
+    "message", "edited_message",
+    "message_reaction", "message_reaction_count",
+    "my_chat_member", "chat_member",
+])
+
 
 def _beat(ctx):
     try:
@@ -510,7 +589,7 @@ def cmd_poll(ctx, _a):
                 time.sleep(backoff)
             off = _read(ctx.off)
             off = int(off) if off.isdigit() else 0
-            params = {"timeout": 30, "limit": 100}
+            params = {"timeout": 30, "limit": 100, "allowed_updates": _ALLOWED_UPDATES}
             if off > 0:
                 params["offset"] = off + 1
             try:
@@ -567,6 +646,23 @@ def _fmt_line(ctx, r, watched, topics_cache):
     chat = r.get("chat") or {}
     if watched is not None and chat.get("id") not in watched:
         return None
+    kind = r.get("kind")
+    if kind == "reaction":
+        who = (r.get("from") or {}).get("first_name") or "?"
+        old, new = r.get("old") or [], r.get("new") or []
+        added = [e for e in new if e not in old]
+        removed = [e for e in old if e not in new]
+        chg = ("+" + " ".join(added) if added else "") + \
+              (" -" + " ".join(removed) if removed else "")
+        return "RXN %s on msg %s: %s" % (who, r.get("message_id"), chg.strip() or "(cleared)")
+    if kind == "reaction_count":
+        summary = " ".join("%s×%s" % (c.get("emoji"), c.get("count"))
+                           for c in (r.get("counts") or [])) or "(none)"
+        return "RXN (count) msg %s: %s" % (r.get("message_id"), summary)
+    if kind == "member":
+        who = (r.get("user") or {}).get("first_name") or "?"
+        scope = "this bot" if r.get("scope") == "me" else "member"
+        return "MBR %s [%s]: %s → %s" % (who, scope, r.get("old_status"), r.get("new_status"))
     name = (r.get("from") or {}).get("first_name") or "?"
     prefix = "[group] " if chat.get("type") in ("group", "supergroup") else ""
     tid = r.get("thread_id")
