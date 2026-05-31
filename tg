@@ -7,7 +7,7 @@ the Telegram Bot API getUpdates long-poll (the only transport any of them used).
 The *code* is shared and global; the *state* and *config* are per-repo, resolved
 from the repo you're standing in:
 
-  state   <repo>/var/telegram/   history.jsonl · offset · poller.pid · media/ · topics.json
+  state   <repo>/var/telegram/   history.jsonl · offset · poller.pid · poller.beat · media/ · topics.json
   config  <repo>/tg.conf         GROUP=... + UPPERCASE chat aliases + TG_TRANSCRIBE_LANG (optional)
           env / .env             secrets: TG_BOT_TOKEN, TG_ELEVENLABS_KEY (optional)
 
@@ -36,6 +36,7 @@ or a numeric id; omit it for the group. (--to still works as a legacy alias.)
   topics [list|set <name> <id>|rm <name>|resolve <name>]
 """
 import sys, os, json, re, time, uuid, signal, datetime, mimetypes, subprocess
+import socket, threading, http.client
 import urllib.request, urllib.parse
 
 
@@ -76,6 +77,7 @@ class Ctx:
         self.hist = os.path.join(self.var, "history.jsonl")
         self.off = os.path.join(self.var, "offset")
         self.pid = os.path.join(self.var, "poller.pid")
+        self.beat = os.path.join(self.var, "poller.beat")
         self.plog = os.path.join(self.var, "poll.log")
         self.media = os.path.join(self.var, "media")
         self.topics = os.path.join(self.var, "topics.json")
@@ -121,12 +123,34 @@ def die(msg, code=1):
 
 # ── HTTP (Telegram Bot API) ─────────────────────────────────────────────────
 
-def _http(url, data=None, headers=None, timeout=60, method=None):
+def _http(url, data=None, headers=None, timeout=60, method=None, opener=None):
     req = urllib.request.Request(url, data=data, method=method)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    _open = opener.open if opener else urllib.request.urlopen
+    with _open(req, timeout=timeout) as r:
         return r.read()
+
+
+class _KeepAliveHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection with TCP keepalive — so a long-poll socket stranded by a
+    silently-dropped connection (e.g. NAT/conntrack eviction across a container
+    suspend/resume) is reset by the kernel in ~35s instead of blocking forever."""
+    def connect(self):
+        super().connect()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for opt, val in (("TCP_KEEPIDLE", 20), ("TCP_KEEPINTVL", 5), ("TCP_KEEPCNT", 3)):
+            o = getattr(socket, opt, None)
+            if o is not None:
+                self.sock.setsockopt(socket.IPPROTO_TCP, o, val)
+
+
+class _KeepAliveHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_KeepAliveHTTPSConnection, req)
+
+
+_KEEPALIVE_OPENER = urllib.request.build_opener(_KeepAliveHTTPSHandler())
 
 
 def api_get(ctx, method, params=None, timeout=60):
@@ -401,15 +425,39 @@ def fetch_media(ctx):
 
 # ── poller (singleton long-poll daemon) ───────────────────────────────────────
 
+# A healthy long-poll iteration returns within ~35s (30s server timeout + slack).
+# STALL = the in-process watchdog force-restarts past this; DEAD = an external
+# checker (doctor / watch) treats a stale heartbeat as dead. DEAD > STALL so the
+# poller gets first crack at restarting itself before anyone double-spawns it.
+POLL_STALL_SECS = 90
+POLLER_DEAD_SECS = 150
+
+
+def _beat(ctx):
+    try:
+        os.utime(ctx.beat, None)
+    except OSError:
+        open(ctx.beat, "w").close()
+
+
 def poller_alive(ctx):
     p = _read(ctx.pid)
     if not p:
         return False
     try:
         os.kill(int(p), 0)
-        return True
     except (OSError, ValueError):
         return False
+    # An alive PID is necessary but not sufficient: a poller wedged in a dead
+    # long-poll socket stays alive forever (offset frozen). Require a fresh
+    # heartbeat too, so a hung poller reads as dead and gets restarted. Absent
+    # heartbeat (just-started, pre-first-beat) trusts the live PID.
+    try:
+        if time.time() - os.path.getmtime(ctx.beat) > POLLER_DEAD_SECS:
+            return False
+    except OSError:
+        pass
+    return True
 
 
 def cmd_poll(ctx, _a):
@@ -418,6 +466,7 @@ def cmd_poll(ctx, _a):
     mypid = os.getpid()
     with open(ctx.pid, "w") as f:
         f.write(str(mypid))
+    _beat(ctx)
 
     def _cleanup(*_):
         if _read(ctx.pid) == str(mypid):
@@ -426,6 +475,26 @@ def cmd_poll(ctx, _a):
         sys.exit(0)
     signal.signal(signal.SIGINT, _cleanup)
     signal.signal(signal.SIGTERM, _cleanup)
+
+    def _watchdog():
+        # Out-of-band liveness: if the loop hasn't completed an iteration within
+        # POLL_STALL_SECS (heartbeat gone stale), it's wedged in getUpdates with
+        # no way to unblock itself from the main thread — force-exit so the box
+        # supervisor respawns us. This is what 'alive PID' liveness can't catch.
+        while True:
+            time.sleep(15)
+            if _read(ctx.pid) != str(mypid):
+                return  # reclaimed; main loop will stand down on its own
+            try:
+                stale = time.time() - os.path.getmtime(ctx.beat)
+            except OSError:
+                continue
+            if stale > POLL_STALL_SECS:
+                with open(ctx.plog, "a") as f:
+                    f.write("poller %s stalled %ds in getUpdates — force-restarting\n"
+                            % (mypid, int(stale)))
+                os._exit(1)
+    threading.Thread(target=_watchdog, daemon=True).start()
 
     open(ctx.hist, "a").close()
     print("poller started (pid %s), cursor %s" % (mypid, _read(ctx.off) or "0"))
@@ -436,6 +505,7 @@ def cmd_poll(ctx, _a):
             if _read(ctx.pid) != str(mypid):
                 print("pidfile reclaimed by another poller — %s standing down" % mypid)
                 return
+            _beat(ctx)  # progress heartbeat: one tick per completed long-poll
             if backoff:
                 time.sleep(backoff)
             off = _read(ctx.off)
@@ -445,7 +515,7 @@ def cmd_poll(ctx, _a):
                 params["offset"] = off + 1
             try:
                 body = _http("%s/getUpdates?%s" % (ctx.api, urllib.parse.urlencode(params)),
-                             timeout=35)
+                             timeout=35, opener=_KEEPALIVE_OPENER)
             except Exception:
                 body = b""
             if not body:
