@@ -33,7 +33,8 @@ The target chat [to] is a uniform optional TRAILING positional — a tg.conf ali
 or a numeric id; omit it for the group. (--to still works as a legacy alias.)
   media                      idempotent backfill: download media + Scribe-transcribe
   ids                        print chat ids seen in history
-  pending                    chats/threads with inbound newer than your last reply (reconcile gap)
+  pending                    chats/threads with inbound newer than your last reply or ack
+  ack [to] [--topic-id N]    mark a chat/thread SEEN (no reply needed) so it drops from `pending`
   topics [list|set <name> <id>|rm <name>|resolve <name>]
 """
 import sys, os, json, re, time, uuid, signal, datetime, mimetypes, subprocess
@@ -947,15 +948,17 @@ def cmd_ids(ctx, _a):
 
 def cmd_pending(ctx, _a):
     """Chats (and forum threads) whose latest inbound message is newer than our
-    latest reply there — i.e. still unanswered. A pure read of history.jsonl
-    (no token needed conceptually); this is the reconcile backstop a session runs
-    after (re-)arming `tg watch`, to catch anything that landed while the live
-    Monitor was down. Reactions / membership / meta rows don't count as messages
-    to answer; forum topics are keyed per-thread so a reply in one thread doesn't
-    mask an unanswered message in another."""
+    latest reply OR ack there — i.e. still needs attention. A pure read of
+    history.jsonl (no token needed conceptually); this is the reconcile backstop a
+    session runs after (re-)arming `tg watch`, to catch anything that landed while
+    the live Monitor was down. An `ack` clears a chat without a reply (seen, nothing
+    to answer), so chatter/FYIs you won't answer don't linger here forever;
+    reactions / membership / meta rows don't count as messages to answer; forum
+    topics are keyed per-thread so a reply in one thread doesn't mask an unanswered
+    message in another."""
     if not os.path.exists(ctx.hist):
         print("no history yet — poll first"); return
-    last_in, last_out, who, msgs = {}, {}, {}, {}
+    last_in, last_out, last_ack, who, msgs = {}, {}, {}, {}, {}
     with open(ctx.hist, encoding="utf-8") as f:
         for line in f:
             try:
@@ -976,18 +979,60 @@ def cmd_pending(ctx, _a):
                 msgs.setdefault(key, []).append((d, r.get("text") or "[%s]" % (r.get("media") or "non-text")))
             elif r.get("direction") == "out":
                 last_out[key] = max(d, last_out.get(key, -1))
-    rows = [(din, key) for key, din in last_in.items() if din > last_out.get(key, -1)]
+            elif r.get("kind") == "ack":         # seen, no reply needed — clears like a reply
+                last_ack[key] = max(d, last_ack.get(key, -1))
+    def seen(key):                               # watermark: replied-to OR acked, whichever is later
+        return max(last_out.get(key, -1), last_ack.get(key, -1))
+    rows = [(din, key) for key, din in last_in.items() if din > seen(key)]
     if not rows:
         print("all caught up — no unanswered inbound"); return
     for din, key in sorted(rows):
         cid, tid = key
-        dout = last_out.get(key, -1)
-        unanswered = [t for (dd, t) in sorted(msgs.get(key, [])) if dd > dout]
+        wm = seen(key)
+        unanswered = [t for (dd, t) in sorted(msgs.get(key, [])) if dd > wm]
         iso = datetime.datetime.fromtimestamp(din, datetime.UTC).isoformat()
         loc = "%s" % cid + ("" if tid is None else " thread %s" % tid)
         print("%-22s %-12s %d unanswered, last %s" % (loc, who.get(key, "?"), len(unanswered), iso))
         for t in unanswered[-3:]:
             print("    %s" % (t.replace("\n", " ")[:120]))
+    print("→ reply, or `tg ack <chat>` (forum: --topic-id N) for anything that needs no answer")
+
+
+def cmd_ack(ctx, a):
+    """Mark a chat/thread as SEEN — acknowledged, no reply needed — so it stops
+    showing in `tg pending`. Sets a watermark at the latest inbound timestamp there
+    at ack time; anything that arrives later re-surfaces. Lets you clear chatter /
+    FYIs / thanks you legitimately won't answer without sending a reply. Silent —
+    writes only a local history row; to acknowledge VISIBLY to the sender, react
+    instead (`tg react`)."""
+    to = ctx.resolve_chat(_to(a))
+    if not to:
+        die("ack: no target chat", 2)
+    thread = _thread_for(ctx, a.topic, a.topic_id)
+    tid = int(thread) if thread else None
+    latest = None
+    if os.path.exists(ctx.hist):
+        with open(ctx.hist, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("direction") != "in" or r.get("kind"):
+                    continue
+                if (r.get("chat") or {}).get("id") != int(to) or r.get("thread_id") != tid:
+                    continue
+                d = r.get("date")
+                if d is not None and (latest is None or d > latest):
+                    latest = d
+    loc = "%s%s" % (to, "" if tid is None else " thread %s" % tid)
+    if latest is None:
+        print("ack: nothing inbound to ack in %s" % loc); return
+    row = {"kind": "ack", "direction": "meta", "chat": {"id": int(to)}, "thread_id": tid,
+           "date": latest, "iso": datetime.datetime.fromtimestamp(latest, datetime.UTC).isoformat()}
+    with open(ctx.hist, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print("ack: %s — seen through %s" % (loc, row["iso"]))
 
 
 def cmd_topics(ctx, a):
@@ -1055,6 +1100,9 @@ def build_parser():
     s = sub.add_parser("react"); s.add_argument("msg_id"); s.add_argument("emoji", nargs="?"); add_to(s)
     s = sub.add_parser("reactions"); add_to(s)
     s = sub.add_parser("delete"); s.add_argument("msg_id"); add_to(s)
+
+    s = sub.add_parser("ack"); add_to(s)
+    s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
 
     s = sub.add_parser("topics"); s.add_argument("sub", nargs="?"); s.add_argument("args", nargs="*")
     return p
