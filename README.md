@@ -74,6 +74,7 @@ tg reactions [to]                list the emoji this chat actually allows
 tg delete <msg_id> [to]          deleteMessage + synthetic 'deleted' history row
 tg media                         idempotent backfill: download media + Scribe-transcribe
 tg ids                           print chat ids seen in history
+tg pending                       chats/threads with inbound newer than your last reply (reconcile gap)
 tg topics [list|set <name> <id>|rm <name>|resolve <name>]
 ```
 

@@ -33,6 +33,7 @@ The target chat [to] is a uniform optional TRAILING positional — a tg.conf ali
 or a numeric id; omit it for the group. (--to still works as a legacy alias.)
   media                      idempotent backfill: download media + Scribe-transcribe
   ids                        print chat ids seen in history
+  pending                    chats/threads with inbound newer than your last reply (reconcile gap)
   topics [list|set <name> <id>|rm <name>|resolve <name>]
 """
 import sys, os, json, re, time, uuid, signal, datetime, mimetypes, subprocess
@@ -944,6 +945,51 @@ def cmd_ids(ctx, _a):
         print("%15s  %-10s  %s" % (cid, ctype, ", ".join(sorted(names))))
 
 
+def cmd_pending(ctx, _a):
+    """Chats (and forum threads) whose latest inbound message is newer than our
+    latest reply there — i.e. still unanswered. A pure read of history.jsonl
+    (no token needed conceptually); this is the reconcile backstop a session runs
+    after (re-)arming `tg watch`, to catch anything that landed while the live
+    Monitor was down. Reactions / membership / meta rows don't count as messages
+    to answer; forum topics are keyed per-thread so a reply in one thread doesn't
+    mask an unanswered message in another."""
+    if not os.path.exists(ctx.hist):
+        print("no history yet — poll first"); return
+    last_in, last_out, who, msgs = {}, {}, {}, {}
+    with open(ctx.hist, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            d = r.get("date")
+            if d is None:                       # undated rows (failed sends, deletes) carry no ordering
+                continue
+            cid = (r.get("chat") or {}).get("id")
+            if cid is None:
+                continue
+            key = (cid, r.get("thread_id"))
+            if r.get("direction") == "in" and not r.get("kind"):   # real inbound message only
+                if d >= last_in.get(key, -1):
+                    last_in[key] = d
+                    who[key] = (r.get("from") or {}).get("first_name") or "?"
+                msgs.setdefault(key, []).append((d, r.get("text") or "[%s]" % (r.get("media") or "non-text")))
+            elif r.get("direction") == "out":
+                last_out[key] = max(d, last_out.get(key, -1))
+    rows = [(din, key) for key, din in last_in.items() if din > last_out.get(key, -1)]
+    if not rows:
+        print("all caught up — no unanswered inbound"); return
+    for din, key in sorted(rows):
+        cid, tid = key
+        dout = last_out.get(key, -1)
+        unanswered = [t for (dd, t) in sorted(msgs.get(key, [])) if dd > dout]
+        iso = datetime.datetime.fromtimestamp(din, datetime.UTC).isoformat()
+        loc = "%s" % cid + ("" if tid is None else " thread %s" % tid)
+        print("%-22s %-12s %d unanswered, last %s" % (loc, who.get(key, "?"), len(unanswered), iso))
+        for t in unanswered[-3:]:
+            print("    %s" % (t.replace("\n", " ")[:120]))
+
+
 def cmd_topics(ctx, a):
     sub = a.sub or "list"
     if sub == "list":
@@ -985,7 +1031,7 @@ def build_parser():
     p = argparse.ArgumentParser(prog="tg", description="global Telegram bot CLI (repo-local state)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("poll"); sub.add_parser("doctor"); sub.add_parser("watch")
-    sub.add_parser("media"); sub.add_parser("ids")
+    sub.add_parser("media"); sub.add_parser("ids"); sub.add_parser("pending")
 
     # The target chat is a uniform optional TRAILING positional, defaulting to
     # the group; `--to` stays as a hidden legacy alias (see _to()).
