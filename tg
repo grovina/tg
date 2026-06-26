@@ -25,6 +25,7 @@ Commands:
   sendvoice <text> [to]      ElevenLabs TTS -> opus -> sendVoice
   senddoc <path> [to]        sendDocument — file attachment (+ --caption --topic …)
   sendphoto <path> [to]      sendPhoto — inline image    (+ --caption --html --topic …)
+  sendpoll <q> <opt…>        sendPoll — question + 2-10 options (--quiz N --multi --public --topic …; target via --to)
   react <msg_id> [emoji] [to]  setMessageReaction (empty emoji clears reaction)
   reactions [to]             list the emoji this chat actually allows as reactions
   delete <msg_id> [to]       deleteMessage + synthetic 'deleted' history row
@@ -666,11 +667,9 @@ def _fmt_line(ctx, r, watched, topics_cache):
         scope = "this bot" if r.get("scope") == "me" else "member"
         return "MBR %s [%s]: %s → %s" % (who, scope, r.get("old_status"), r.get("new_status"))
     name = (r.get("from") or {}).get("first_name") or "?"
-    prefix = "[group] " if chat.get("type") in ("group", "supergroup") else ""
     tid = r.get("thread_id")
-    if tid is None:
-        topic = ""
-    else:
+    topic_tag = ""
+    if tid is not None:
         # reverse topics map, refreshed on mtime change
         try:
             mt = os.stat(ctx.topics).st_mtime
@@ -680,20 +679,26 @@ def _fmt_line(ctx, r, watched, topics_cache):
             topics_cache["rev"] = {v: k for k, v in topics_load(ctx.topics).items()}
             topics_cache["mtime"] = mt
         nm = topics_cache.get("rev", {}).get(int(tid))
-        topic = " [#%s]" % nm if nm else " [#thread:%s]" % tid
+        topic_tag = "#%s" % nm if nm else "#thread:%s" % tid
+    # One leading bracket carries both the group marker and (for forum
+    # supergroups) the topic the message landed in: "[group]" / "[group #general]".
+    if chat.get("type") in ("group", "supergroup"):
+        prefix = "[group%s] " % (" " + topic_tag if topic_tag else "")
+    else:
+        prefix = ""
     txt = r.get("text")
     if txt:
-        return "MSG %s%s%s: %s" % (prefix, name, topic, txt.replace("\n", " / "))
+        return "MSG %s%s: %s" % (prefix, name, txt.replace("\n", " / "))
     med = r.get("media")
     if med:
         kind = med.get("type", "media")
         tail = " — transcribing…" if kind in _WATCH_TRANSCRIBE else " [media saved]"
-        return "MSG %s%s%s: %s %s%s%s" % (prefix, name, topic, _ICON.get(kind, "📦"),
-                                          kind, _dur(med.get("duration")), tail)
+        return "MSG %s%s: %s %s%s%s" % (prefix, name, _ICON.get(kind, "📦"),
+                                        kind, _dur(med.get("duration")), tail)
     rk = r.get("raw_keys")
     if rk:
-        return "MSG %s%s%s: (no text/media — telegram fields: %s)" % (prefix, name, topic, ", ".join(rk))
-    return "MSG %s%s%s: (non-text message, no media — check Telegram)" % (prefix, name, topic)
+        return "MSG %s%s: (no text/media — telegram fields: %s)" % (prefix, name, ", ".join(rk))
+    return "MSG %s%s: (non-text message, no media — check Telegram)" % (prefix, name)
 
 
 def cmd_watch(ctx, _a):
@@ -858,6 +863,47 @@ def cmd_sendphoto(ctx, a):
         die("sendPhoto failed: %s" % j.get("description"))
     _log_out(ctx, to, j["result"])
     print("ok photo msg %s" % j["result"].get("message_id"))
+
+
+def cmd_sendpoll(ctx, a):
+    # Unlike the other send* commands, the target is NOT a trailing positional:
+    # the poll options are variadic, so a trailing [to] would be ambiguous. Use
+    # --to (or the default group). Topic targeting works as everywhere else.
+    to = ctx.resolve_chat(_to(a))
+    if not to:
+        die("sendpoll: no target. Set GROUP in tg.conf or pass --to <id>.", 2)
+    if not (2 <= len(a.options) <= 10):
+        die("sendpoll: need 2-10 options (got %d)" % len(a.options), 2)
+    quiz = a.quiz is not None
+    if quiz and not (0 <= a.quiz < len(a.options)):
+        die("sendpoll: --quiz index %d out of range (0..%d)" % (a.quiz, len(a.options) - 1), 2)
+    thread = _thread_for(ctx, a.topic, a.topic_id)
+    if a.dry_run:
+        print("DRY: poll to=%s thread=%s type=%s anon=%s opts=%d" % (
+            to, thread or "General", "quiz" if quiz else "regular",
+            not a.public, len(a.options)))
+        return
+    fields = {
+        "chat_id": to, "question": a.question,
+        "options": json.dumps([{"text": o} for o in a.options], ensure_ascii=False),
+        "is_anonymous": "false" if a.public else "true",
+    }
+    if quiz:
+        fields["type"] = "quiz"
+        fields["correct_option_id"] = a.quiz
+    elif a.multi:                                  # multiple answers only apply to regular polls
+        fields["allows_multiple_answers"] = "true"
+    if thread:
+        fields["message_thread_id"] = thread
+    j = api_post(ctx, "sendPoll", fields)
+    if not j.get("ok"):
+        die("sendpoll failed: %s" % j.get("description"))
+    r = j["result"]
+    _log_out(ctx, to, r, extra={"text": a.question, "poll": {
+        "type": "quiz" if quiz else "regular", "options": list(a.options),
+        "anonymous": not a.public, "multi": bool(a.multi),
+        "correct_option_id": a.quiz if quiz else None}})
+    print("ok poll msg %s" % r.get("message_id"))
 
 
 # Telegram's global default reaction set (Bot API). A chat's admins may narrow
@@ -1096,6 +1142,16 @@ def build_parser():
     s = sub.add_parser("sendphoto"); s.add_argument("path"); add_to(s)
     s.add_argument("--caption"); s.add_argument("--html", action="store_true")
     s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
+
+    # Options are variadic, so [to] can't be a trailing positional here — target
+    # comes from --to (defaults to the group), unlike the other send* commands.
+    s = sub.add_parser("sendpoll"); s.add_argument("question"); s.add_argument("options", nargs="+")
+    s.add_argument("--to", dest="to_flag", help="target chat (tg.conf alias or id); omit for the group")
+    s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
+    s.add_argument("--multi", action="store_true", help="allow multiple answers (regular poll)")
+    s.add_argument("--quiz", type=int, metavar="N", help="quiz poll; N = 0-based index of the correct option")
+    s.add_argument("--public", action="store_true", help="non-anonymous poll (default: anonymous)")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true")
 
     s = sub.add_parser("react"); s.add_argument("msg_id"); s.add_argument("emoji", nargs="?"); add_to(s)
     s = sub.add_parser("reactions"); add_to(s)

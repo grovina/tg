@@ -69,6 +69,7 @@ tg send <text> [to]              [--topic name|--topic-id N] [--html] [--dry-run
 tg sendvoice <text> [to]         ElevenLabs TTS → opus → voice note
 tg senddoc <path> [to]           file attachment   [--caption] [--topic …]
 tg sendphoto <path> [to]         inline image      [--caption] [--html] [--topic …]
+tg sendpoll <q> <opt…>           poll, 2-10 options [--quiz N] [--multi] [--public] [--topic …] [--to chat]
 tg react <msg_id> [emoji] [to]   empty emoji clears the reaction
 tg reactions [to]                list the emoji this chat actually allows
 tg delete <msg_id> [to]          deleteMessage + synthetic 'deleted' history row
@@ -84,7 +85,15 @@ an **optional trailing positional** (`to`): a `tg.conf` alias (`ALICE`) or a
 numeric id; **omit it for the group** (`GROUP`). So `tg send "hi"` goes to the
 group and `tg send "hi" alice` to Alice — same shape for `react`, `senddoc`,
 `sendphoto`, `delete`. (`--to` still works as a legacy alias, but the positional
-is canonical.)
+is canonical.) The one exception is `sendpoll`: its options are variadic, so a
+trailing `to` would be ambiguous — pass the target with `--to` (defaults to the
+group) there.
+
+**Polls:** `tg sendpoll "Lunch?" Pizza Sushi Salad` posts a regular,
+**anonymous** poll to the group. `--multi` allows multiple answers; `--public`
+makes votes non-anonymous; `--quiz N` turns it into a quiz with the 0-based
+`N`-th option as the correct one. `--topic`/`--topic-id` target a forum thread
+like the other send commands.
 
 **Reactions are a fixed set.** Telegram only lets a bot react with emoji from a
 global allowed list, which a group's admins can narrow further — you can't react
