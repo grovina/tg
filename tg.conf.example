@@ -3,7 +3,10 @@
 # Secrets do NOT go here — see README (TG_BOT_TOKEN, TG_ELEVENLABS_KEY via env).
 
 # Chat registry. GROUP is the default `send` target; UPPERCASE names are
-# aliases resolvable by `--to <name>`. Find ids with `tg ids` after polling.
+# aliases resolvable by `--to <name>`. They also LABEL inbound events: a message
+# from a registered id shows as `MSG [ALICE 10000001] …` in `watch`/`pending`,
+# so look-alike chats stay distinct and replies target the right one. Find ids
+# with `tg ids` after polling.
 GROUP=-1001234567890
 ALICE=10000001
 
