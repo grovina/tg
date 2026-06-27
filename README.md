@@ -66,6 +66,7 @@ tg poll                          long-poll daemon (pid-guarded singleton, idempo
 tg doctor                        (re)start the poller detached if dead
 tg watch                         doctor + watchdog + follow history.jsonl → Monitor stream
 tg send <text> [to]              [--topic name|--topic-id N] [--html] [--dry-run]
+tg reply <msg_id> <text>         answer IN the originating chat (resolved from history) + thread it [--html]
 tg sendvoice <text> [to]         ElevenLabs TTS → opus → voice note
 tg senddoc <path> [to]           file attachment   [--caption] [--topic …]
 tg sendphoto <path> [to]         inline image      [--caption] [--html] [--topic …]
@@ -88,6 +89,15 @@ group and `tg send "hi" alice` to Alice — same shape for `react`, `senddoc`,
 is canonical.) The one exception is `sendpoll`: its options are variadic, so a
 trailing `to` would be ambiguous — pass the target with `--to` (defaults to the
 group) there.
+
+**Replying — never infer the target.** `watch` and `pending` name each inbound
+channel by **identity and carry its chat_id**, so two same-type chats can't be
+confused: `MSG [BACKOFFICE -5470784074] Jerome #156: …`. To answer, copy a token
+straight off that line — `tg reply 156 "<text>"` (by the `#<id>` after the
+sender; resolves the chat + forum thread from history and threads the reply in
+place) or `tg send "<text>" -5470784074` (by the chat_id). Don't route a reply
+by a type word like `group` — that's how a Backoffice `group` and an OPS
+`supergroup`, both once rendered `[group]`, got crossed.
 
 **Polls:** `tg sendpoll "Lunch?" Pizza Sushi Salad` posts a regular,
 **anonymous** poll to the group. `--multi` allows multiple answers; `--public`

@@ -22,6 +22,7 @@ Commands:
   doctor                     (re)start the poller detached if dead
   watch                      doctor + watchdog + follow history.jsonl -> Monitor stream
   send <text> [to]           sendMessage   (+ --topic <name>|--topic-id <n> --html --dry-run)
+  reply <msg_id> <text>      reply IN the originating chat (resolved from history) + thread it (+ --html)
   sendvoice <text> [to]      ElevenLabs TTS -> opus -> sendVoice
   senddoc <path> [to]        sendDocument — file attachment (+ --caption --topic …)
   sendphoto <path> [to]      sendPhoto — inline image    (+ --caption --html --topic …)
@@ -32,6 +33,12 @@ Commands:
 
 The target chat [to] is a uniform optional TRAILING positional — a tg.conf alias
 or a numeric id; omit it for the group. (--to still works as a legacy alias.)
+
+`watch`/`pending` name each inbound channel by IDENTITY and carry its chat_id —
+"MSG [BACKOFFICE -5470784074] Jerome #156: …" — so two same-type chats never
+collide and a reply targets the right one mechanically: `tg reply 156 <text>`
+(by the `#<id>`) or `tg send <text> -5470784074` (by the chat_id). Never infer a
+target from a type word.
   media                      idempotent backfill: download media + Scribe-transcribe
   ids                        print chat ids seen in history
   pending                    chats/threads with inbound newer than your last reply or ack
@@ -98,8 +105,26 @@ class Ctx:
         self.api = "https://api.telegram.org/bot%s" % self.token
         self.filebase = "https://api.telegram.org/file/bot%s" % self.token
 
+        # Reverse of the chat registry: chat_id -> symbolic alias, so inbound
+        # events can name their channel by IDENTITY (GROUP / BACKOFFICE / a DM
+        # name…) instead of an ambiguous Telegram type. Built from the same
+        # UPPERCASE alias=chat_id pairs resolve_chat() reads; a value must look
+        # like a chat id (≥5 digits, optional sign) so ordinary env vars don't
+        # masquerade as channels. First alias for an id wins (tg.conf is merged
+        # before .env / environ).
+        self.chat_names = {}
+        for k, v in cfg.items():
+            if k.startswith("TG_") or not re.fullmatch(r"[A-Z][A-Z0-9_]*", k):
+                continue
+            if re.fullmatch(r"-?\d{5,}", str(v)):
+                self.chat_names.setdefault(str(v), k)
+
     def get(self, key, default=None):
         return self.cfg.get(key, default)
+
+    def chat_alias(self, cid):
+        """Symbolic name for a chat_id (the inverse of resolve_chat), or None."""
+        return self.chat_names.get(str(cid)) if cid is not None else None
 
     def resolve_chat(self, name):
         """Symbolic name -> chat_id. '', group, team -> GROUP; numeric passes through."""
@@ -680,12 +705,20 @@ def _fmt_line(ctx, r, watched, topics_cache):
             topics_cache["mtime"] = mt
         nm = topics_cache.get("rev", {}).get(int(tid))
         topic_tag = "#%s" % nm if nm else "#thread:%s" % tid
-    # One leading bracket carries both the group marker and (for forum
-    # supergroups) the topic the message landed in: "[group]" / "[group #general]".
-    if chat.get("type") in ("group", "supergroup"):
-        prefix = "[group%s] " % (" " + topic_tag if topic_tag else "")
-    else:
-        prefix = ""
+    # The leading bracket names the channel by IDENTITY and carries its chat_id,
+    # so a reply can target the originating chat mechanically — never by guessing
+    # an alias from an ambiguous type tag (the trap where a Backoffice `group`
+    # and the OPS `supergroup` both render as "[group]"). A tg.conf alias wins;
+    # otherwise we fall back to "DM" (private) or the raw Telegram type. Forum
+    # supergroups still carry the topic the message landed in. The `#<id>` after
+    # the sender is the message id — feed it to `tg reply` to answer in place.
+    cid = chat.get("id")
+    label = ctx.chat_alias(cid) or ("DM" if chat.get("type") == "private"
+                                    else (chat.get("type") or "?"))
+    bits = [label] + ([str(cid)] if cid is not None else []) + ([topic_tag] if topic_tag else [])
+    prefix = "[%s] " % " ".join(bits)
+    mid = r.get("message_id")
+    name = "%s #%s" % (name, mid) if mid is not None else name
     txt = r.get("text")
     if txt:
         return "MSG %s%s: %s" % (prefix, name, txt.replace("\n", " / "))
@@ -788,6 +821,46 @@ def cmd_send(ctx, a):
         die("send failed: %s" % j.get("description"))
     _log_out(ctx, to, j["result"])
     print("ok msg %s" % j["result"].get("message_id"))
+
+
+def cmd_reply(ctx, a):
+    """Reply to a specific inbound message BY its id — the foolproof primitive:
+    the target chat (and forum thread) is resolved from history.jsonl, never
+    inferred, and the reply is threaded with reply_to_message_id. Use the `#<id>`
+    shown after the sender in `tg watch` / `tg pending` lines. This is the safe
+    way to answer the channel a message came from when several look alike."""
+    if not re.fullmatch(r"\d+", str(a.msg_id)):
+        die("reply: msg_id must be numeric (the #<id> from a watch/pending line)", 2)
+    mid = int(a.msg_id)
+    origin = None
+    if os.path.exists(ctx.hist):
+        with open(ctx.hist, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("direction") == "in" and not r.get("kind") \
+                        and r.get("message_id") == mid:
+                    origin = r            # keep scanning → most recent match wins
+    if not origin:
+        die("reply: no inbound message #%s in history (poll first?)" % mid, 2)
+    to = (origin.get("chat") or {}).get("id")
+    if to is None:
+        die("reply: message #%s carries no chat id" % mid, 2)
+    fields = {"chat_id": str(to), "text": a.text, "reply_to_message_id": str(mid),
+              "allow_sending_without_reply": "true"}  # deleted origin still delivers
+    if a.html:
+        fields["parse_mode"] = "HTML"
+    tid = origin.get("thread_id")
+    if tid is not None:
+        fields["message_thread_id"] = str(tid)
+    j = api_post(ctx, "sendMessage", fields)
+    if not j.get("ok"):
+        die("reply failed: %s" % j.get("description"))
+    _log_out(ctx, str(to), j["result"])
+    where = ctx.chat_alias(to) or to
+    print("ok msg %s → reply in [%s %s]" % (j["result"].get("message_id"), where, to))
 
 
 def cmd_sendvoice(ctx, a):
@@ -1022,7 +1095,8 @@ def cmd_pending(ctx, _a):
                 if d >= last_in.get(key, -1):
                     last_in[key] = d
                     who[key] = (r.get("from") or {}).get("first_name") or "?"
-                msgs.setdefault(key, []).append((d, r.get("text") or "[%s]" % (r.get("media") or "non-text")))
+                msgs.setdefault(key, []).append((d, r.get("text") or "[%s]" % (r.get("media") or "non-text"),
+                                                 r.get("message_id")))
             elif r.get("direction") == "out":
                 last_out[key] = max(d, last_out.get(key, -1))
             elif r.get("kind") == "ack":         # seen, no reply needed — clears like a reply
@@ -1035,13 +1109,14 @@ def cmd_pending(ctx, _a):
     for din, key in sorted(rows):
         cid, tid = key
         wm = seen(key)
-        unanswered = [t for (dd, t) in sorted(msgs.get(key, [])) if dd > wm]
+        unanswered = [(mid, t) for (dd, t, mid) in sorted(msgs.get(key, [])) if dd > wm]
         iso = datetime.datetime.fromtimestamp(din, datetime.UTC).isoformat()
-        loc = "%s" % cid + ("" if tid is None else " thread %s" % tid)
-        print("%-22s %-12s %d unanswered, last %s" % (loc, who.get(key, "?"), len(unanswered), iso))
-        for t in unanswered[-3:]:
-            print("    %s" % (t.replace("\n", " ")[:120]))
-    print("→ reply, or `tg ack <chat>` (forum: --topic-id N) for anything that needs no answer")
+        alias = ctx.chat_alias(cid)
+        loc = (alias + " " if alias else "") + str(cid) + ("" if tid is None else " thread %s" % tid)
+        print("%-30s %-12s %d unanswered, last %s" % (loc, who.get(key, "?"), len(unanswered), iso))
+        for mid, t in unanswered[-3:]:
+            print("    #%-9s %s" % (mid, t.replace("\n", " ")[:110]))
+    print("→ `tg reply <#id> <text>` to answer in place, or `tg ack <chat>` for anything that needs no answer")
 
 
 def cmd_ack(ctx, a):
@@ -1133,6 +1208,10 @@ def build_parser():
     s = sub.add_parser("send"); s.add_argument("text"); add_to(s)
     s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
     s.add_argument("--html", action="store_true"); s.add_argument("--dry-run", dest="dry_run", action="store_true")
+
+    # reply targets the chat of the message it answers — no [to], by design.
+    s = sub.add_parser("reply"); s.add_argument("msg_id"); s.add_argument("text")
+    s.add_argument("--html", action="store_true")
 
     s = sub.add_parser("sendvoice"); s.add_argument("text"); add_to(s)
 
