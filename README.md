@@ -71,6 +71,7 @@ tg sendvoice <text> [to]         ElevenLabs TTS → opus → voice note
 tg senddoc <path> [to]           file attachment   [--caption] [--topic …]
 tg sendphoto <path> [to]         inline image      [--caption] [--html] [--topic …]
 tg sendpoll <q> <opt…>           poll, 2-10 options [--quiz N] [--multi] [--public] [--topic …] [--to chat]
+tg pollstatus [msg_id]           who voted each option + which options nobody picked [--poll-id ID] (needs --public)
 tg react <msg_id> [emoji] [to]   empty emoji clears the reaction
 tg reactions [to]                list the emoji this chat actually allows
 tg delete <msg_id> [to]          deleteMessage + synthetic 'deleted' history row
@@ -90,6 +91,14 @@ is canonical.) The one exception is `sendpoll`: its options are variadic, so a
 trailing `to` would be ambiguous — pass the target with `--to` (defaults to the
 group) there.
 
+**Omitting a target ≠ passing an empty one.** Only a genuinely *omitted* target
+falls back to the group. An **empty** (`tg send "hi" ""`) or **unknown**
+(`tg send "hi" NOPE`) target is a hard error, never the group — because an empty
+arg is almost always an unset shell var (`tg send "hi" "$BACKOFFICE"` with
+`$BACKOFFICE` undefined), and silently broadcasting a meant-for-one-person DM to
+the whole group is exactly the footgun to avoid. The unknown-alias error lists
+the aliases your `tg.conf` actually defines.
+
 **Replying — never infer the target.** `watch` and `pending` name each inbound
 channel by **identity and carry its chat_id**, so two same-type chats can't be
 confused: `MSG [BACKOFFICE -5470784074] Jerome #156: …`. To answer, copy a token
@@ -104,6 +113,14 @@ by a type word like `group` — that's how a Backoffice `group` and an OPS
 makes votes non-anonymous; `--quiz N` turns it into a quiz with the 0-based
 `N`-th option as the correct one. `--topic`/`--topic-id` target a forum thread
 like the other send commands.
+
+**Who voted — `pollstatus`.** The poller persists every vote (`poll_answer`) on a
+poll the bot sent, so `tg pollstatus <msg_id>` tallies, per option, **who** picked
+it and **which options nobody picked** — a checklist (`--multi --public`) whose
+unticked items are the tasks still undone at end of service. The latest answer per
+voter wins (a vote change replaces it; clearing all options retracts it). This
+needs **`--public`**: Telegram delivers individual voters only for non-anonymous
+polls — an anonymous poll yields no voters, and `pollstatus` says so.
 
 **Reactions are a fixed set.** Telegram only lets a bot react with emoji from a
 global allowed list, which a group's admins can narrow further — you can't react

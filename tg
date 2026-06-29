@@ -27,6 +27,7 @@ Commands:
   senddoc <path> [to]        sendDocument — file attachment (+ --caption --topic …)
   sendphoto <path> [to]      sendPhoto — inline image    (+ --caption --html --topic …)
   sendpoll <q> <opt…>        sendPoll — question + 2-10 options (--quiz N --multi --public --topic …; target via --to)
+  pollstatus [msg_id]        per-option tally of a poll WE sent: who voted each option + which options nobody picked (needs --public)
   react <msg_id> [emoji] [to]  setMessageReaction (empty emoji clears reaction)
   reactions [to]             list the emoji this chat actually allows as reactions
   delete <msg_id> [to]       deleteMessage + synthetic 'deleted' history row
@@ -127,13 +128,26 @@ class Ctx:
         return self.chat_names.get(str(cid)) if cid is not None else None
 
     def resolve_chat(self, name):
-        """Symbolic name -> chat_id. '', group, team -> GROUP; numeric passes through."""
+        """Symbolic name -> chat_id. 'group'/'team' -> GROUP; a numeric id passes
+        through; an UPPERCASE alias must be defined in tg.conf. An unknown alias or
+        a missing GROUP is a HARD ERROR — never a silent group fallback (that's how
+        a DM meant for one person ends up broadcast to the whole staff group). The
+        empty/omitted case is handled upstream in _to(), which alone can tell an
+        OMITTED target (→ group) apart from an explicitly EMPTY one (→ refused)."""
         n = (name or "").strip()
-        if n in ("", "group", "team"):
-            return self.cfg.get("GROUP", "")
+        if n in ("group", "team"):
+            g = self.cfg.get("GROUP", "")
+            if not g:
+                die("no GROUP configured — set GROUP=<chat_id> in tg.conf", 2)
+            return g
         if re.fullmatch(r"-?\d+", n):
             return n
-        return self.cfg.get(n.upper(), "")
+        cid = self.cfg.get(n.upper(), "")
+        if not cid:
+            known = ", ".join(sorted(set(self.chat_names.values()))) or "(none)"
+            die("unknown target chat %r — known aliases: %s. Pass a numeric chat_id, "
+                "a defined alias, or omit the target entirely for the group." % (name, known), 2)
+        return cid
 
 
 def _read(path):
@@ -336,6 +350,19 @@ def _event_row(u):
                 "message_id": mrc.get("message_id"),
                 "date": mrc.get("date"), "iso": _iso(mrc.get("date")),
                 "chat": _chat(mrc.get("chat")), "counts": counts}
+    pa = u.get("poll_answer")
+    if pa:
+        # A vote on a poll WE sent. Non-anonymous polls carry `user`; anonymous
+        # ones never produce poll_answer at all. option_ids is the voter's CURRENT
+        # full selection — Telegram REPLACES it on every change, so the latest row
+        # per (poll_id, voter) wins; an empty list means the vote was retracted.
+        # poll_answer carries no chat and no date — we stamp receive time so the
+        # latest-wins ordering in `pollstatus` has something to sort on.
+        voter = pa.get("user") or pa.get("voter_chat")
+        now = int(time.time())
+        return {"direction": "in", "kind": "poll_answer", "update_id": u["update_id"],
+                "poll_id": pa.get("poll_id"), "date": now, "iso": _iso(now),
+                "from": _who(voter), "option_ids": pa.get("option_ids") or []}
     which = "my_chat_member" if u.get("my_chat_member") else \
             ("chat_member" if u.get("chat_member") else None)
     if which:
@@ -527,16 +554,18 @@ def fetch_media(ctx):
 POLL_STALL_SECS = 90
 POLLER_DEAD_SECS = 150
 
-# Opt into reaction + membership updates. allowed_updates REPLACES Telegram's
-# default set (it doesn't add to it), so the message types we still want must be
-# listed too. message_reaction / message_reaction_count / chat_member are NOT in
-# the default set — without this they never arrive. Caveat: a *user's* reaction
-# (message_reaction) only reaches a bot that is an admin in the group; otherwise
-# just the anonymous message_reaction_count aggregate is delivered.
+# Opt into reaction + membership + poll-vote updates. allowed_updates REPLACES
+# Telegram's default set (it doesn't add to it), so the message types we still
+# want must be listed too. message_reaction / message_reaction_count /
+# chat_member / poll_answer are NOT in the default set — without this they never
+# arrive. Caveat: a *user's* reaction (message_reaction) only reaches a bot that
+# is an admin in the group; otherwise just the anonymous message_reaction_count
+# aggregate is delivered. Likewise poll_answer carries the individual voter ONLY
+# for non-anonymous polls (`sendpoll --public`); anonymous polls reveal no voters.
 _ALLOWED_UPDATES = json.dumps([
     "message", "edited_message",
     "message_reaction", "message_reaction_count",
-    "my_chat_member", "chat_member",
+    "my_chat_member", "chat_member", "poll_answer",
 ])
 
 
@@ -671,6 +700,14 @@ def _fmt_line(ctx, r, watched, topics_cache):
         return "MSG [voice transcript #%s]: %s" % (r.get("ref_message_id"), t)
     if r.get("direction") != "in":
         return None
+    if r.get("kind") == "poll_answer":
+        # No chat on a poll_answer, so it bypasses the watched-chat filter below
+        # (it'd be dropped otherwise). Live view shows option indices; `tg
+        # pollstatus` resolves them to option text and tallies who's missing.
+        who = (r.get("from") or {}).get("first_name") or "?"
+        opts = r.get("option_ids") or []
+        sel = "options " + ",".join(map(str, opts)) if opts else "(retracted)"
+        return "POLL %s → %s (poll …%s)" % (who, sel, (r.get("poll_id") or "")[-6:])
     chat = r.get("chat") or {}
     if watched is not None and chat.get("id") not in watched:
         return None
@@ -784,8 +821,23 @@ def _log_out(ctx, chat, result, extra=None):
 def _to(a):
     """Target chat name: the trailing positional, else the legacy --to alias,
     else 'group'. One rule for every outbound command so a model never has to
-    recall which take a flag vs a positional."""
-    return getattr(a, "to", None) or getattr(a, "to_flag", None) or "group"
+    recall which take a flag vs a positional.
+
+    An OMITTED target (argparse leaves it None) means the group — the documented
+    default. An EXPLICITLY EMPTY target ("") is refused, not defaulted: an empty
+    arg is almost always an unset shell var (`tg send "…" "$BACKOFFICE"` with
+    $BACKOFFICE undefined), and silently routing that to the group is the footgun
+    that has leaked a private DM into the staff group. So `tg send "…"` → group,
+    but `tg send "…" ""` → error."""
+    to, to_flag = getattr(a, "to", None), getattr(a, "to_flag", None)
+    chosen = to if to is not None else to_flag
+    if chosen is None:
+        return "group"
+    if not chosen.strip():
+        die("empty target chat — omit the target entirely to mean the group; an empty "
+            "argument is refused (usually an unset $VAR) so a DM never silently lands "
+            "in the group", 2)
+    return chosen
 
 
 def _thread_for(ctx, topic_name, topic_id):
@@ -805,8 +857,6 @@ def _thread_for(ctx, topic_name, topic_id):
 
 def cmd_send(ctx, a):
     to = ctx.resolve_chat(_to(a))
-    if not to:
-        die("send: no target. Set GROUP in tg.conf or pass --to <id>.", 2)
     thread = _thread_for(ctx, a.topic, a.topic_id)
     if a.dry_run:
         print("DRY: to=%s thread=%s html=%s len=%d" % (to, thread or "General", a.html, len(a.text)))
@@ -865,8 +915,6 @@ def cmd_reply(ctx, a):
 
 def cmd_sendvoice(ctx, a):
     to = ctx.resolve_chat(_to(a))
-    if not to:
-        die("sendvoice: no target chat", 2)
     if not _which("ffmpeg"):
         die("sendvoice: ffmpeg required", 3)
     import tempfile, shutil
@@ -894,8 +942,6 @@ def cmd_sendvoice(ctx, a):
 
 def cmd_senddoc(ctx, a):
     to = ctx.resolve_chat(_to(a))
-    if not to:
-        die("senddoc: no target chat", 2)
     if not os.path.exists(a.path):
         die("senddoc: no such file: %s" % a.path, 2)
     thread = _thread_for(ctx, a.topic, a.topic_id)
@@ -916,8 +962,6 @@ def cmd_senddoc(ctx, a):
 
 def cmd_sendphoto(ctx, a):
     to = ctx.resolve_chat(_to(a))
-    if not to:
-        die("sendphoto: no target chat", 2)
     if not os.path.exists(a.path):
         die("sendphoto: no such file: %s" % a.path, 2)
     thread = _thread_for(ctx, a.topic, a.topic_id)
@@ -943,8 +987,6 @@ def cmd_sendpoll(ctx, a):
     # the poll options are variadic, so a trailing [to] would be ambiguous. Use
     # --to (or the default group). Topic targeting works as everywhere else.
     to = ctx.resolve_chat(_to(a))
-    if not to:
-        die("sendpoll: no target. Set GROUP in tg.conf or pass --to <id>.", 2)
     if not (2 <= len(a.options) <= 10):
         die("sendpoll: need 2-10 options (got %d)" % len(a.options), 2)
     quiz = a.quiz is not None
@@ -972,11 +1014,93 @@ def cmd_sendpoll(ctx, a):
     if not j.get("ok"):
         die("sendpoll failed: %s" % j.get("description"))
     r = j["result"]
+    poll_id = (r.get("poll") or {}).get("id")   # ties poll_answer rows back to this poll
     _log_out(ctx, to, r, extra={"text": a.question, "poll": {
+        "poll_id": poll_id,
         "type": "quiz" if quiz else "regular", "options": list(a.options),
         "anonymous": not a.public, "multi": bool(a.multi),
         "correct_option_id": a.quiz if quiz else None}})
-    print("ok poll msg %s" % r.get("message_id"))
+    nudge = "" if a.public else \
+        "  (anonymous — `tg pollstatus` can't show who voted; re-send with --public)"
+    print("ok poll msg %s%s" % (r.get("message_id"), nudge))
+
+
+def cmd_pollstatus(ctx, a):
+    """Per-option tally of a poll WE sent: who selected each option, and which
+    options nobody has selected yet — the 'unchecked checklist items'. Reads the
+    poll_answer rows the poller persisted; the latest answer per voter wins (a
+    vote change REPLACES, an empty selection retracts). Only meaningful for polls
+    sent with `--public` — anonymous polls reveal no individual voters.
+
+    Target the poll by its message id (`tg pollstatus 4567` — the id printed by
+    sendpoll / shown in watch) or `--poll-id <id>`; with neither, the most recent
+    poll in history is used."""
+    if not os.path.exists(ctx.hist):
+        die("no history yet — poll first", 2)
+    want_mid = None
+    if getattr(a, "msg_id", None) is not None:
+        if not re.fullmatch(r"\d+", str(a.msg_id)):
+            die("pollstatus: msg_id must be numeric (the poll's message id)", 2)
+        want_mid = int(a.msg_id)
+    want_pid = getattr(a, "poll_id", None)
+    poll_row, answers = None, {}     # answers: poll_id -> {voter_id: (date, name, option_ids)}
+    with open(ctx.hist, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("direction") == "out" and r.get("poll"):
+                p = r["poll"]
+                if want_pid is not None and p.get("poll_id") != want_pid:
+                    continue
+                if want_mid is not None and r.get("message_id") != want_mid:
+                    continue
+                poll_row = r                         # keep scanning → most recent match wins
+            elif r.get("kind") == "poll_answer" and r.get("poll_id"):
+                vid = (r.get("from") or {}).get("id")
+                if vid is None:
+                    continue
+                cur = answers.setdefault(r["poll_id"], {})
+                d = r.get("date") or 0
+                if vid not in cur or d >= cur[vid][0]:   # latest answer per voter wins
+                    cur[vid] = (d, (r.get("from") or {}).get("first_name") or "?",
+                                r.get("option_ids") or [])
+    if not poll_row:
+        die("pollstatus: no matching poll in history — send one with `tg sendpoll` "
+            "(and the poller must have ingested the votes)", 2)
+    poll = poll_row["poll"]
+    pid, options = poll.get("poll_id"), poll.get("options") or []
+    mid = poll_row.get("message_id")
+    cid = (poll_row.get("chat") or {}).get("id")
+    question = poll_row.get("text") or ""
+    voters = answers.get(pid, {})
+    per_option = {i: [] for i in range(len(options))}
+    for _vid, (_d, name, opt_ids) in voters.items():
+        for oi in opt_ids:
+            if 0 <= oi < len(options):
+                per_option[oi].append(name)
+    alias = ctx.chat_alias(cid)
+    loc = (alias + " " if alias else "") + str(cid)
+    active = sum(1 for v in voters.values() if v[2])     # voters with a non-empty selection
+    print('poll #%s in [%s]: "%s"  (%d voter%s)' % (
+        mid, loc, question, active, "" if active == 1 else "s"))
+    if poll.get("anonymous"):
+        print("  ⚠ ANONYMOUS poll — Telegram reveals no individual voters; "
+              "re-send with `--public` for per-person tracking")
+    unchecked = []
+    for i, text in enumerate(options):
+        names = per_option.get(i, [])
+        if not names:
+            unchecked.append((i, text))
+        print("  [%2d] %-28s %s" % (i, text, ", ".join(sorted(names)) or "—"))
+    if not options:
+        return
+    if unchecked:
+        print("unchecked (%d): %s" % (len(unchecked),
+              ", ".join("#%d %s" % (i, t) for i, t in unchecked)))
+    else:
+        print("all options have at least one vote ✓")
 
 
 # Telegram's global default reaction set (Bot API). A chat's admins may narrow
@@ -990,8 +1114,6 @@ _DEFAULT_REACTIONS = (
 
 def cmd_reactions(ctx, a):
     to = ctx.resolve_chat(_to(a))
-    if not to:
-        die("reactions: no target chat", 2)
     j = api_get(ctx, "getChat", {"chat_id": to})
     if not j.get("ok"):
         die("getChat failed: %s" % j.get("description"))
@@ -1014,8 +1136,6 @@ def cmd_reactions(ctx, a):
 
 def cmd_react(ctx, a):
     to = ctx.resolve_chat(_to(a))
-    if not to:
-        die("react: no target chat", 2)
     reaction = [] if not a.emoji else [{"type": "emoji", "emoji": a.emoji}]
     j = api_post(ctx, "setMessageReaction",
                  {"chat_id": to, "message_id": a.msg_id, "reaction": json.dumps(reaction)})
@@ -1030,8 +1150,6 @@ def cmd_react(ctx, a):
 
 def cmd_delete(ctx, a):
     to = ctx.resolve_chat(_to(a))
-    if not to:
-        die("delete: no target chat", 2)
     j = api_post(ctx, "deleteMessage", {"chat_id": to, "message_id": a.msg_id})
     row = {"kind": "deleted", "direction": "out", "chat": {"id": int(to)},
            "ref_message_id": int(a.msg_id), "date": int(time.time()), "api_response": j}
@@ -1127,8 +1245,6 @@ def cmd_ack(ctx, a):
     writes only a local history row; to acknowledge VISIBLY to the sender, react
     instead (`tg react`)."""
     to = ctx.resolve_chat(_to(a))
-    if not to:
-        die("ack: no target chat", 2)
     thread = _thread_for(ctx, a.topic, a.topic_id)
     tid = int(thread) if thread else None
     latest = None
@@ -1231,6 +1347,10 @@ def build_parser():
     s.add_argument("--quiz", type=int, metavar="N", help="quiz poll; N = 0-based index of the correct option")
     s.add_argument("--public", action="store_true", help="non-anonymous poll (default: anonymous)")
     s.add_argument("--dry-run", dest="dry_run", action="store_true")
+
+    s = sub.add_parser("pollstatus")
+    s.add_argument("msg_id", nargs="?", help="the poll's message id (omit for the most recent poll)")
+    s.add_argument("--poll-id", dest="poll_id", help="target by Telegram poll_id instead of message id")
 
     s = sub.add_parser("react"); s.add_argument("msg_id"); s.add_argument("emoji", nargs="?"); add_to(s)
     s = sub.add_parser("reactions"); add_to(s)
