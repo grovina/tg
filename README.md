@@ -65,8 +65,8 @@ Config is read from `tg.conf` then `.env`, with environment variables winning.
 tg poll                          long-poll daemon (pid-guarded singleton, idempotent)
 tg doctor                        (re)start the poller detached if dead
 tg watch                         doctor + watchdog + follow history.jsonl → Monitor stream
-tg send <text> [to]              [--topic name|--topic-id N] [--html] [--dry-run]
-tg reply <msg_id> <text>         answer IN the originating chat (resolved from history) + thread it [--html]
+tg send <text|--file F> [to]     [--topic name|--topic-id N] [--html] [--dry-run]
+tg reply <msg_id> <text|--file F>  answer IN the originating chat (resolved from history) + thread it [--html]
 tg sendvoice <text> [to]         ElevenLabs TTS → opus → voice note
 tg senddoc <path> [to]           file attachment   [--caption] [--topic …]
 tg sendphoto <path> [to]         inline image      [--caption] [--html] [--topic …]
@@ -81,6 +81,12 @@ tg pending                       chats/threads with inbound newer than your last
 tg ack [to] [--topic-id N]       mark a chat/thread SEEN (no reply needed) so it drops from `pending`
 tg topics [list|set <name> <id>|rm <name>|resolve <name>]
 ```
+
+**Long or quote-heavy text — use `--file`.** `send` and `reply` accept
+`--file PATH` instead of inline text: write the message to a file and pass the
+path. This sidesteps the shell-quoting trap where a stray `'` or `"` in the
+message closes the shell string mid-sentence. The trailing positional target
+still works (`tg send --file msg.txt alice`).
 
 **Target chat — one rule everywhere.** Every outbound command takes the chat as
 an **optional trailing positional** (`to`): a `tg.conf` alias (`ALICE`) or a
