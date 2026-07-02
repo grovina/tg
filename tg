@@ -21,8 +21,8 @@ Commands:
   poll                       long-poll daemon (pid-guarded singleton, idempotent)
   doctor                     (re)start the poller detached if dead
   watch                      doctor + watchdog + follow history.jsonl -> Monitor stream
-  send <text> [to]           sendMessage   (+ --topic <name>|--topic-id <n> --html --dry-run)
-  reply <msg_id> <text>      reply IN the originating chat (resolved from history) + thread it (+ --html)
+  send <text|--file F> [to]  sendMessage   (+ --topic <name>|--topic-id <n> --html --dry-run)
+  reply <msg_id> <text|--file F>  reply IN the originating chat (resolved from history) + thread it (+ --html)
   sendvoice <text> [to]      ElevenLabs TTS -> opus -> sendVoice
   senddoc <path> [to]        sendDocument — file attachment (+ --caption --topic …)
   sendphoto <path> [to]      sendPhoto — inline image    (+ --caption --html --topic …)
@@ -855,13 +855,37 @@ def _thread_for(ctx, topic_name, topic_id):
     return None
 
 
+def _msg_text(a):
+    """Message text: inline positional, or --file PATH. --file sidesteps the shell-
+    quoting trap (a stray ' or " in inline text closes the shell string mid-message);
+    write the message to a file and pass the path. Trailing newline stripped."""
+    if getattr(a, "text_file", None):
+        if a.text is not None:
+            if hasattr(a, "to") and a.to is None:
+                a.to = a.text          # `send --file f.txt DOM`: positional is the target
+            else:
+                die("give the text either inline or via --file, not both", 2)
+        try:
+            with open(a.text_file, encoding="utf-8") as f:
+                text = f.read().rstrip("\n")
+        except OSError as e:
+            die("cannot read --file: %s" % e, 2)
+        if not text:
+            die("--file %s is empty" % a.text_file, 2)
+        return text
+    if a.text is None:
+        die("no message text (pass it inline or via --file PATH)", 2)
+    return a.text
+
+
 def cmd_send(ctx, a):
+    text = _msg_text(a)
     to = ctx.resolve_chat(_to(a))
     thread = _thread_for(ctx, a.topic, a.topic_id)
     if a.dry_run:
-        print("DRY: to=%s thread=%s html=%s len=%d" % (to, thread or "General", a.html, len(a.text)))
+        print("DRY: to=%s thread=%s html=%s len=%d" % (to, thread or "General", a.html, len(text)))
         return
-    fields = {"chat_id": to, "text": a.text}
+    fields = {"chat_id": to, "text": text}
     if a.html:
         fields["parse_mode"] = "HTML"
     if thread:
@@ -879,6 +903,7 @@ def cmd_reply(ctx, a):
     inferred, and the reply is threaded with reply_to_message_id. Use the `#<id>`
     shown after the sender in `tg watch` / `tg pending` lines. This is the safe
     way to answer the channel a message came from when several look alike."""
+    text = _msg_text(a)
     if not re.fullmatch(r"\d+", str(a.msg_id)):
         die("reply: msg_id must be numeric (the #<id> from a watch/pending line)", 2)
     mid = int(a.msg_id)
@@ -898,7 +923,7 @@ def cmd_reply(ctx, a):
     to = (origin.get("chat") or {}).get("id")
     if to is None:
         die("reply: message #%s carries no chat id" % mid, 2)
-    fields = {"chat_id": str(to), "text": a.text, "reply_to_message_id": str(mid),
+    fields = {"chat_id": str(to), "text": text, "reply_to_message_id": str(mid),
               "allow_sending_without_reply": "true"}  # deleted origin still delivers
     if a.html:
         fields["parse_mode"] = "HTML"
@@ -1321,12 +1346,14 @@ def build_parser():
         s.add_argument("to", nargs="?", help="target chat (tg.conf alias or id); omit for the group")
         s.add_argument("--to", dest="to_flag", help=argparse.SUPPRESS)
 
-    s = sub.add_parser("send"); s.add_argument("text"); add_to(s)
+    s = sub.add_parser("send"); s.add_argument("text", nargs="?"); add_to(s)
+    s.add_argument("--file", dest="text_file", help="read the message text from FILE (avoids shell-quoting traps)")
     s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
     s.add_argument("--html", action="store_true"); s.add_argument("--dry-run", dest="dry_run", action="store_true")
 
     # reply targets the chat of the message it answers — no [to], by design.
-    s = sub.add_parser("reply"); s.add_argument("msg_id"); s.add_argument("text")
+    s = sub.add_parser("reply"); s.add_argument("msg_id"); s.add_argument("text", nargs="?")
+    s.add_argument("--file", dest="text_file", help="read the reply text from FILE (avoids shell-quoting traps)")
     s.add_argument("--html", action="store_true")
 
     s = sub.add_parser("sendvoice"); s.add_argument("text"); add_to(s)
