@@ -2,8 +2,9 @@
 # Read at the repo root (the dir holding tg.conf / var/telegram / .git).
 # Secrets do NOT go here — see README (TG_BOT_TOKEN, TG_ELEVENLABS_KEY via env).
 
-# Chat registry. GROUP is the default `send` target; UPPERCASE names are
-# aliases resolvable by `--to <name>`. They also LABEL inbound events: a message
+# Chat registry. GROUP backs the `group`/`team` target; UPPERCASE names are
+# aliases you pass as the target (`tg send ALICE "hi"`). They also LABEL inbound
+# events: a message
 # from a registered id shows as `MSG [ALICE 10000001] …` in `watch`/`pending`,
 # so look-alike chats stay distinct and replies target the right one. Find ids
 # with `tg ids` after polling.
