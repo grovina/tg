@@ -77,6 +77,7 @@ tg reactions [to]                list the emoji this chat actually allows
 tg delete <msg_id> [to]          deleteMessage + synthetic 'deleted' history row
 tg media                         idempotent backfill: download media + Scribe-transcribe
 tg ids                           print chat ids seen in history
+tg show <msg_id>                 full untruncated text of one inbound message (+ media / voice transcript)
 tg pending                       chats/threads with inbound newer than your last reply or ack
 tg ack [to] [--topic-id N]       mark a chat/thread SEEN (no reply needed) so it drops from `pending`
 tg topics [list|set <name> <id>|rm <name>|resolve <name>]
@@ -113,6 +114,14 @@ sender; resolves the chat + forum thread from history and threads the reply in
 place) or `tg send "<text>" -5470784074` (by the chat_id). Don't route a reply
 by a type word like `group` — that's how a Backoffice `group` and an OPS
 `supergroup`, both once rendered `[group]`, got crossed.
+
+**Reading a clipped message — `show`.** The live `watch` stream (and the Monitor
+that surfaces it) renders one line per message and can clip a long one. That same
+`#<id>` you'd reply to also fetches the whole thing: `tg show 156` prints the
+full untruncated text — plus sender, chat, thread, date, and any media type or
+voice transcript — straight from `history.jsonl`, so there's no hand-grepping the
+log for the rest of a message. An edited message shows its current text, flagged
+`(edited)`.
 
 **Polls:** `tg sendpoll "Lunch?" Pizza Sushi Salad` posts a regular,
 **anonymous** poll to the group. `--multi` allows multiple answers; `--public`

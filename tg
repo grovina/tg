@@ -1208,6 +1208,65 @@ def cmd_ids(ctx, _a):
         print("%15s  %-10s  %s" % (cid, ctype, ", ".join(sorted(names))))
 
 
+def cmd_show(ctx, a):
+    """Print the FULL stored record for one inbound message id: the complete text
+    untruncated, plus sender / chat / thread / date and any media or voice
+    transcript. Every `tg watch` line ends with `#<id>`, but the live view (and
+    the Monitor that surfaces it) can clip a long message — `tg show <id>`
+    recovers the whole thing without hand-grepping var/telegram/history.jsonl."""
+    if not os.path.exists(ctx.hist):
+        print("no history yet — poll first"); return
+    try:
+        mid = int(a.msg_id)
+    except (TypeError, ValueError):
+        die("show: message id must be numeric (got %r)" % a.msg_id, 2)
+    hits, transcripts = [], []
+    with open(ctx.hist, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("message_id") == mid and r.get("direction") == "in" and not r.get("kind"):
+                hits.append(r)          # append-only: an edit lands as a later row, same id
+            elif r.get("kind") == "transcript" and r.get("ref_message_id") == mid:
+                transcripts.append(r)
+    if not hits:
+        print("no inbound message #%s in history%s" % (
+            mid, " (voice transcript only — below)" if transcripts else ""))
+        for t in transcripts:
+            print("\n[voice transcript]\n%s" % (t.get("text") or ""))
+        return
+    r = hits[-1]                        # the last row is the current text (edits supersede)
+    chat = r.get("chat") or {}
+    cid = chat.get("id")
+    label = ctx.chat_alias(cid) or chat.get("title") or (
+        "DM" if chat.get("type") == "private" else (chat.get("type") or "?"))
+    frm = r.get("from") or {}
+    who = frm.get("first_name") or "?"
+    if frm.get("username"):
+        who += " (@%s)" % frm["username"]
+    hdr = "#%s  from %s  in [%s%s]" % (mid, who, label, "" if cid is None else " %s" % cid)
+    if r.get("thread_id") is not None:
+        hdr += " thread %s" % r["thread_id"]
+    if r.get("iso"):
+        hdr += "  %s" % r["iso"]
+    if r.get("edited") or len(hits) > 1:
+        hdr += "  (edited)"
+    print(hdr)
+    med = r.get("media")
+    if med:
+        print("media: %s%s" % (med.get("type", "media"), _dur(med.get("duration"))))
+    txt = r.get("text")
+    if txt:
+        print()
+        print(txt)                      # FULL text, verbatim — the whole point
+    elif not med and r.get("raw_keys"):
+        print("(no text/media — telegram fields: %s)" % ", ".join(r["raw_keys"]))
+    for t in transcripts:
+        print("\n[voice transcript]\n%s" % (t.get("text") or ""))
+
+
 def cmd_pending(ctx, _a):
     """Chats (and forum threads) whose latest inbound message is newer than our
     latest reply OR ack there — i.e. still needs attention. A pure read of
@@ -1339,6 +1398,7 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("poll"); sub.add_parser("doctor"); sub.add_parser("watch")
     sub.add_parser("media"); sub.add_parser("ids"); sub.add_parser("pending")
+    s = sub.add_parser("show"); s.add_argument("msg_id", help="inbound message id (the `#<id>` shown in tg watch/pending)")
 
     # The target chat is a uniform optional TRAILING positional, defaulting to
     # the group; `--to` stays as a hidden legacy alias (see _to()).
