@@ -40,7 +40,7 @@ Stdlib only (Python 3.11+). `sendvoice` (TTS) additionally needs `ffmpeg`.
 ## Config (`tg.conf` at repo root)
 
 ```ini
-# chat registry — GROUP is the default `send` target; aliases resolve by name
+# chat registry — GROUP backs `group`/`team`; UPPERCASE aliases resolve by name
 GROUP=-1001234567890
 ALICE=10000001
 # behavior (all optional)
@@ -65,53 +65,62 @@ Config is read from `tg.conf` then `.env`, with environment variables winning.
 tg poll                          long-poll daemon (pid-guarded singleton, idempotent)
 tg doctor                        (re)start the poller detached if dead
 tg watch                         doctor + watchdog + follow history.jsonl → Monitor stream
-tg send <text|--file F> [to]     [--topic name|--topic-id N] [--html] [--dry-run]
+tg send <to> <text|--file F>     [--topic name|--topic-id N] [--html] [--dry-run]
 tg reply <msg_id> <text|--file F>  answer IN the originating chat (resolved from history) + thread it [--html]
-tg sendvoice <text> [to]         ElevenLabs TTS → opus → voice note
-tg senddoc <path> [to]           file attachment   [--caption] [--topic …]
-tg sendphoto <path> [to]         inline image      [--caption] [--html] [--topic …]
-tg sendpoll <q> <opt…>           poll, 2-10 options [--quiz N] [--multi] [--public] [--topic …] [--to chat]
+tg sendvoice <to> <text>         ElevenLabs TTS → opus → voice note
+tg senddoc <to> <path>           file attachment   [--caption] [--topic …]
+tg sendphoto <to> <path>         inline image      [--caption] [--html] [--topic …]
+tg sendpoll <q> <opt…> --to X    poll, 2-10 options [--quiz N] [--multi] [--public] [--topic …]
 tg pollstatus [msg_id]           who voted each option + which options nobody picked [--poll-id ID] (needs --public)
-tg react <msg_id> [emoji] [to]   empty emoji clears the reaction
-tg reactions [to]                list the emoji this chat actually allows
-tg delete <msg_id> [to]          deleteMessage + synthetic 'deleted' history row
+tg react <msg_id> [emoji]        empty emoji clears; chat resolved from history [--to override]
+tg reactions <to>                list the emoji this chat actually allows
+tg delete <msg_id>               deleteMessage + synthetic 'deleted' history row; chat from history [--to override]
 tg media                         idempotent backfill: download media + Scribe-transcribe
 tg ids                           print chat ids seen in history
 tg show <msg_id>                 full untruncated text of one inbound message (+ media / voice transcript)
 tg pending                       chats/threads with inbound newer than your last reply or ack
-tg ack [to] [--topic-id N]       mark a chat/thread SEEN (no reply needed) so it drops from `pending`
+tg ack <to> [--topic-id N]       mark a chat/thread SEEN (no reply needed) so it drops from `pending`
 tg topics [list|set <name> <id>|rm <name>|resolve <name>]
 ```
+
+**Target chat — recipient first, always explicit.** Every send command takes the
+chat as its **required leading positional** (`to`): `group`/`team` for the group,
+a `tg.conf` alias (`ALICE`), or a numeric id. `tg send GROUP "hi"`, `tg send alice
+"hi"` — same shape for `sendvoice`, `senddoc`, `sendphoto`. Two rules earn their
+keep:
+
+- **Recipient first.** Like every messaging tool (`/msg nick text`, IRC
+  `PRIVMSG <target> <text>`), the addressee leads and the free-form message
+  trails — so a broken shell quote in the message can only swallow tokens *after*
+  it, and the target sits safely in front, already parsed.
+- **No group default.** Omitting the target is a **hard error**, never a silent
+  broadcast. An absent target is almost always one a broken quote or unset `$VAR`
+  ate; defaulting *that* to the group is how a private DM once leaked to the whole
+  staff group. So `tg send "hi"` is refused (name the target); the group is reached
+  only by naming it. An empty (`""`) or unknown target is likewise a hard error
+  that lists your defined aliases.
+
+`sendpoll` is the one exception to *positional*: its options are variadic, so the
+target comes from `--to` (also required). `--to CHAT` is accepted everywhere as an
+order-independent alternative to the positional.
 
 **Long or quote-heavy text — use `--file`.** `send` and `reply` accept
 `--file PATH` instead of inline text: write the message to a file and pass the
 path. This sidesteps the shell-quoting trap where a stray `'` or `"` in the
-message closes the shell string mid-sentence. The trailing positional target
-still works (`tg send --file msg.txt alice`).
+message closes the shell string mid-sentence. With recipient-first order the
+target is unambiguous: `tg send alice --file msg.txt`.
 
-**Target chat — one rule everywhere.** Every outbound command takes the chat as
-an **optional trailing positional** (`to`): a `tg.conf` alias (`ALICE`) or a
-numeric id; **omit it for the group** (`GROUP`). So `tg send "hi"` goes to the
-group and `tg send "hi" alice` to Alice — same shape for `react`, `senddoc`,
-`sendphoto`, `delete`. (`--to` still works as a legacy alias, but the positional
-is canonical.) The one exception is `sendpoll`: its options are variadic, so a
-trailing `to` would be ambiguous — pass the target with `--to` (defaults to the
-group) there.
-
-**Omitting a target ≠ passing an empty one.** Only a genuinely *omitted* target
-falls back to the group. An **empty** (`tg send "hi" ""`) or **unknown**
-(`tg send "hi" NOPE`) target is a hard error, never the group — because an empty
-arg is almost always an unset shell var (`tg send "hi" "$BACKOFFICE"` with
-`$BACKOFFICE` undefined), and silently broadcasting a meant-for-one-person DM to
-the whole group is exactly the footgun to avoid. The unknown-alias error lists
-the aliases your `tg.conf` actually defines.
+**`react` / `delete` need no target.** They're keyed by the message id and resolve
+the originating chat from history (like `reply`): `tg react 156 👍`, `tg delete
+156`. Pass `--to <chat>` only to override (or if the message predates your
+history).
 
 **Replying — never infer the target.** `watch` and `pending` name each inbound
 channel by **identity and carry its chat_id**, so two same-type chats can't be
 confused: `MSG [BACKOFFICE -5470784074] Jerome #156: …`. To answer, copy a token
 straight off that line — `tg reply 156 "<text>"` (by the `#<id>` after the
 sender; resolves the chat + forum thread from history and threads the reply in
-place) or `tg send "<text>" -5470784074` (by the chat_id). Don't route a reply
+place) or `tg send -5470784074 "<text>"` (by the chat_id). Don't route a reply
 by a type word like `group` — that's how a Backoffice `group` and an OPS
 `supergroup`, both once rendered `[group]`, got crossed.
 
@@ -123,7 +132,7 @@ voice transcript — straight from `history.jsonl`, so there's no hand-grepping 
 log for the rest of a message. An edited message shows its current text, flagged
 `(edited)`.
 
-**Polls:** `tg sendpoll "Lunch?" Pizza Sushi Salad` posts a regular,
+**Polls:** `tg sendpoll "Lunch?" Pizza Sushi Salad --to group` posts a regular,
 **anonymous** poll to the group. `--multi` allows multiple answers; `--public`
 makes votes non-anonymous; `--quiz N` turns it into a quiz with the 0-based
 `N`-th option as the correct one. `--topic`/`--topic-id` target a forum thread
@@ -139,7 +148,7 @@ polls — an anonymous poll yields no voters, and `pollstatus` says so.
 
 **Reactions are a fixed set.** Telegram only lets a bot react with emoji from a
 global allowed list, which a group's admins can narrow further — you can't react
-with arbitrary emoji. `tg reactions [to]` prints what the target chat actually
+with arbitrary emoji. `tg reactions <to>` prints what the target chat actually
 permits (via `getChat`), so pick from that list; a rejected `react` reports
 Telegram's reason.
 

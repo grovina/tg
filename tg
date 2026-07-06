@@ -21,29 +21,35 @@ Commands:
   poll                       long-poll daemon (pid-guarded singleton, idempotent)
   doctor                     (re)start the poller detached if dead
   watch                      doctor + watchdog + follow history.jsonl -> Monitor stream
-  send <text|--file F> [to]  sendMessage   (+ --topic <name>|--topic-id <n> --html --dry-run)
+  send <to> <text|--file F>  sendMessage   (+ --topic <name>|--topic-id <n> --html --dry-run)
   reply <msg_id> <text|--file F>  reply IN the originating chat (resolved from history) + thread it (+ --html)
-  sendvoice <text> [to]      ElevenLabs TTS -> opus -> sendVoice
-  senddoc <path> [to]        sendDocument — file attachment (+ --caption --topic …)
-  sendphoto <path> [to]      sendPhoto — inline image    (+ --caption --html --topic …)
+  sendvoice <to> <text>      ElevenLabs TTS -> opus -> sendVoice
+  senddoc <to> <path>        sendDocument — file attachment (+ --caption --topic …)
+  sendphoto <to> <path>      sendPhoto — inline image    (+ --caption --html --topic …)
   sendpoll <q> <opt…>        sendPoll — question + 2-10 options (--quiz N --multi --public --topic …; target via --to)
   pollstatus [msg_id]        per-option tally of a poll WE sent: who voted each option + which options nobody picked (needs --public)
-  react <msg_id> [emoji] [to]  setMessageReaction (empty emoji clears reaction)
-  reactions [to]             list the emoji this chat actually allows as reactions
-  delete <msg_id> [to]       deleteMessage + synthetic 'deleted' history row
+  react <msg_id> [emoji]     setMessageReaction (empty emoji clears; chat from history, --to overrides)
+  reactions <to>             list the emoji this chat actually allows as reactions
+  delete <msg_id>            deleteMessage + synthetic 'deleted' history row (chat from history, --to overrides)
 
-The target chat [to] is a uniform optional TRAILING positional — a tg.conf alias
-or a numeric id; omit it for the group. (--to still works as a legacy alias.)
+The target chat <to> is a REQUIRED LEADING positional on every send command — the
+recipient comes first (like every messaging tool), and the free-form message goes
+last where a broken shell quote can't swallow it. There is NO group default:
+omitting the target is a hard error, never a silent broadcast to the group (that's
+how a private DM once leaked to the whole staff group). Reach the group explicitly
+with `group`/`team`, an alias, or its id; `--to` is an order-independent alternative.
+reply/react/delete take no target — they resolve the chat from the message id in
+history (react/delete accept --to to override).
 
 `watch`/`pending` name each inbound channel by IDENTITY and carry its chat_id —
 "MSG [BACKOFFICE -5470784074] Jerome #156: …" — so two same-type chats never
 collide and a reply targets the right one mechanically: `tg reply 156 <text>`
-(by the `#<id>`) or `tg send <text> -5470784074` (by the chat_id). Never infer a
+(by the `#<id>`) or `tg send -5470784074 <text>` (by the chat_id). Never infer a
 target from a type word.
   media                      idempotent backfill: download media + Scribe-transcribe
   ids                        print chat ids seen in history
   pending                    chats/threads with inbound newer than your last reply or ack
-  ack [to] [--topic-id N]    mark a chat/thread SEEN (no reply needed) so it drops from `pending`
+  ack <to> [--topic-id N]    mark a chat/thread SEEN (no reply needed) so it drops from `pending`
   topics [list|set <name> <id>|rm <name>|resolve <name>]
 """
 import sys, os, json, re, time, uuid, signal, datetime, mimetypes, subprocess
@@ -132,8 +138,8 @@ class Ctx:
         through; an UPPERCASE alias must be defined in tg.conf. An unknown alias or
         a missing GROUP is a HARD ERROR — never a silent group fallback (that's how
         a DM meant for one person ends up broadcast to the whole staff group). The
-        empty/omitted case is handled upstream in _to(), which alone can tell an
-        OMITTED target (→ group) apart from an explicitly EMPTY one (→ refused)."""
+        empty/omitted case is refused upstream in _to(): there is no group default,
+        so the group must be named explicitly ('group'/'team', an alias, or its id)."""
         n = (name or "").strip()
         if n in ("group", "team"):
             g = self.cfg.get("GROUP", "")
@@ -145,8 +151,8 @@ class Ctx:
         cid = self.cfg.get(n.upper(), "")
         if not cid:
             known = ", ".join(sorted(set(self.chat_names.values()))) or "(none)"
-            die("unknown target chat %r — known aliases: %s. Pass a numeric chat_id, "
-                "a defined alias, or omit the target entirely for the group." % (name, known), 2)
+            die("unknown target chat %r — known aliases: %s. Pass a numeric chat_id, a "
+                "defined alias, or `group`/`team` for the group." % (name, known), 2)
         return cid
 
 
@@ -819,24 +825,31 @@ def _log_out(ctx, chat, result, extra=None):
 
 
 def _to(a):
-    """Target chat name: the trailing positional, else the legacy --to alias,
-    else 'group'. One rule for every outbound command so a model never has to
-    recall which take a flag vs a positional.
+    """Resolve the REQUIRED target chat: the leading positional `to`, else the
+    `--to` flag. There is no group default — a target must be named explicitly
+    (`group`/`team`, a tg.conf alias, or a numeric id). One rule for every
+    outbound command so a model never has to recall which take a flag vs a
+    positional.
 
-    An OMITTED target (argparse leaves it None) means the group — the documented
-    default. An EXPLICITLY EMPTY target ("") is refused, not defaulted: an empty
-    arg is almost always an unset shell var (`tg send "…" "$BACKOFFICE"` with
-    $BACKOFFICE undefined), and silently routing that to the group is the footgun
-    that has leaked a private DM into the staff group. So `tg send "…"` → group,
-    but `tg send "…" ""` → error."""
+    Omitting the target is an ERROR, not a silent broadcast to the group: an
+    absent target is almost always one a broken shell quote swallowed, and
+    defaulting that to the group is the footgun that leaked a private DM into the
+    staff group. (Target-first argument order + this hard error together close it:
+    the fragile free-form message goes last where it can't eat the target, and a
+    lost target fails closed instead of broadcasting.) An empty ("") target — the
+    unset-$VAR case — and giving both the positional and --to are likewise
+    refused."""
     to, to_flag = getattr(a, "to", None), getattr(a, "to_flag", None)
+    if to is not None and to_flag is not None and to.strip() != to_flag.strip():
+        die("target given twice (positional %r and --to %r) — pass it once" % (to, to_flag), 2)
     chosen = to if to is not None else to_flag
     if chosen is None:
-        return "group"
+        die("no target chat — name one explicitly: `group`/`team`, a tg.conf alias, "
+            "or a numeric chat id. The group is never a silent default: a swallowed "
+            "target must fail, not broadcast a DM to everyone. Usage: tg <cmd> <to> …", 2)
     if not chosen.strip():
-        die("empty target chat — omit the target entirely to mean the group; an empty "
-            "argument is refused (usually an unset $VAR) so a DM never silently lands "
-            "in the group", 2)
+        die("empty target chat — usually an unset $VAR; refused so a DM never lands in "
+            "the wrong chat. Name the target explicitly (`group`/`team`, an alias, or an id).", 2)
     return chosen
 
 
@@ -856,15 +869,14 @@ def _thread_for(ctx, topic_name, topic_id):
 
 
 def _msg_text(a):
-    """Message text: inline positional, or --file PATH. --file sidesteps the shell-
-    quoting trap (a stray ' or " in inline text closes the shell string mid-message);
-    write the message to a file and pass the path. Trailing newline stripped."""
+    """Message text: the inline positional, or --file PATH. --file sidesteps the
+    shell-quoting trap (a stray ' or " in inline text closes the shell string
+    mid-message) — write the message to a file and pass the path. With target-first
+    argument order the target is parsed before the text, so --file needs no special-
+    casing to tell them apart. Trailing newline stripped."""
     if getattr(a, "text_file", None):
-        if a.text is not None:
-            if hasattr(a, "to") and a.to is None:
-                a.to = a.text          # `send --file f.txt DOM`: positional is the target
-            else:
-                die("give the text either inline or via --file, not both", 2)
+        if getattr(a, "text", None) is not None:
+            die("give the message either inline or via --file, not both", 2)
         try:
             with open(a.text_file, encoding="utf-8") as f:
                 text = f.read().rstrip("\n")
@@ -873,12 +885,23 @@ def _msg_text(a):
         if not text:
             die("--file %s is empty" % a.text_file, 2)
         return text
-    if a.text is None:
+    if getattr(a, "text", None) is None:
         die("no message text (pass it inline or via --file PATH)", 2)
     return a.text
 
 
 def cmd_send(ctx, a):
+    # `send --to X <msg>`: both positionals are optional, so argparse drops <msg>
+    # into the leading `to` slot. If --to already named the target, the lone
+    # positional is really the message — shift it back.
+    if a.to_flag is not None and a.text is None and a.to is not None:
+        a.text, a.to = a.to, None
+    # A single positional lands in `to` (recipient-first), leaving no text — the
+    # classic old-habit slip (`tg send "my message"`). Teach the new order here
+    # rather than let it fall through to a bare "no message text".
+    if a.text is None and not a.text_file and a.to is not None and a.to_flag is None:
+        die("no message text — order is `tg send <to> <text>` (recipient first). You gave "
+            "only %r; add the message after the target, or use --file PATH." % a.to, 2)
     text = _msg_text(a)
     to = ctx.resolve_chat(_to(a))
     thread = _thread_for(ctx, a.topic, a.topic_id)
@@ -897,16 +920,11 @@ def cmd_send(ctx, a):
     print("ok msg %s" % j["result"].get("message_id"))
 
 
-def cmd_reply(ctx, a):
-    """Reply to a specific inbound message BY its id — the foolproof primitive:
-    the target chat (and forum thread) is resolved from history.jsonl, never
-    inferred, and the reply is threaded with reply_to_message_id. Use the `#<id>`
-    shown after the sender in `tg watch` / `tg pending` lines. This is the safe
-    way to answer the channel a message came from when several look alike."""
-    text = _msg_text(a)
-    if not re.fullmatch(r"\d+", str(a.msg_id)):
-        die("reply: msg_id must be numeric (the #<id> from a watch/pending line)", 2)
-    mid = int(a.msg_id)
+def _inbound_msg(ctx, mid):
+    """The stored inbound row for a message id (latest match wins — an edit lands
+    as a later row, same id), or None if we never ingested it. The mechanical way
+    reply / react / delete target the ORIGINATING chat (and forum thread) instead
+    of guessing it from an ambiguous type word."""
     origin = None
     if os.path.exists(ctx.hist):
         with open(ctx.hist, encoding="utf-8") as f:
@@ -918,6 +936,35 @@ def cmd_reply(ctx, a):
                 if r.get("direction") == "in" and not r.get("kind") \
                         and r.get("message_id") == mid:
                     origin = r            # keep scanning → most recent match wins
+    return origin
+
+
+def _resolve_msg_target(ctx, a, mid, cmd):
+    """Chat for a message-id-primary command (react / delete): an explicit --to
+    override wins; otherwise the originating chat, resolved from history. Never the
+    group by default — an unknown message with no --to is a hard error, not a
+    broadcast."""
+    if getattr(a, "to_flag", None):
+        return ctx.resolve_chat(a.to_flag)
+    origin = _inbound_msg(ctx, mid)
+    cid = (origin or {}).get("chat", {}).get("id") if origin else None
+    if cid is None:
+        die("%s: don't know which chat msg #%s is in — it's not in history. Pass "
+            "--to <chat> to name it explicitly." % (cmd, mid), 2)
+    return str(cid)
+
+
+def cmd_reply(ctx, a):
+    """Reply to a specific inbound message BY its id — the foolproof primitive:
+    the target chat (and forum thread) is resolved from history.jsonl, never
+    inferred, and the reply is threaded with reply_to_message_id. Use the `#<id>`
+    shown after the sender in `tg watch` / `tg pending` lines. This is the safe
+    way to answer the channel a message came from when several look alike."""
+    text = _msg_text(a)
+    if not re.fullmatch(r"\d+", str(a.msg_id)):
+        die("reply: msg_id must be numeric (the #<id> from a watch/pending line)", 2)
+    mid = int(a.msg_id)
+    origin = _inbound_msg(ctx, mid)
     if not origin:
         die("reply: no inbound message #%s in history (poll first?)" % mid, 2)
     to = (origin.get("chat") or {}).get("id")
@@ -1008,9 +1055,9 @@ def cmd_sendphoto(ctx, a):
 
 
 def cmd_sendpoll(ctx, a):
-    # Unlike the other send* commands, the target is NOT a trailing positional:
-    # the poll options are variadic, so a trailing [to] would be ambiguous. Use
-    # --to (or the default group). Topic targeting works as everywhere else.
+    # Unlike the other send* commands, the target is NOT a leading positional: the
+    # poll options are variadic, so a positional [to] would be ambiguous. Pass it
+    # with --to (required — no group default). Topic targeting works as everywhere.
     to = ctx.resolve_chat(_to(a))
     if not (2 <= len(a.options) <= 10):
         die("sendpoll: need 2-10 options (got %d)" % len(a.options), 2)
@@ -1160,7 +1207,9 @@ def cmd_reactions(ctx, a):
 
 
 def cmd_react(ctx, a):
-    to = ctx.resolve_chat(_to(a))
+    if not re.fullmatch(r"\d+", str(a.msg_id)):
+        die("react: msg_id must be numeric (the #<id> from a watch/pending line)", 2)
+    to = _resolve_msg_target(ctx, a, int(a.msg_id), "react")
     reaction = [] if not a.emoji else [{"type": "emoji", "emoji": a.emoji}]
     j = api_post(ctx, "setMessageReaction",
                  {"chat_id": to, "message_id": a.msg_id, "reaction": json.dumps(reaction)})
@@ -1174,7 +1223,9 @@ def cmd_react(ctx, a):
 
 
 def cmd_delete(ctx, a):
-    to = ctx.resolve_chat(_to(a))
+    if not re.fullmatch(r"\d+", str(a.msg_id)):
+        die("delete: msg_id must be numeric (the #<id> from a watch/pending line)", 2)
+    to = _resolve_msg_target(ctx, a, int(a.msg_id), "delete")
     j = api_post(ctx, "deleteMessage", {"chat_id": to, "message_id": a.msg_id})
     row = {"kind": "deleted", "direction": "out", "chat": {"id": int(to)},
            "ref_message_id": int(a.msg_id), "date": int(time.time()), "api_response": j}
@@ -1400,13 +1451,17 @@ def build_parser():
     sub.add_parser("media"); sub.add_parser("ids"); sub.add_parser("pending")
     s = sub.add_parser("show"); s.add_argument("msg_id", help="inbound message id (the `#<id>` shown in tg watch/pending)")
 
-    # The target chat is a uniform optional TRAILING positional, defaulting to
-    # the group; `--to` stays as a hidden legacy alias (see _to()).
-    def add_to(s):
-        s.add_argument("to", nargs="?", help="target chat (tg.conf alias or id); omit for the group")
-        s.add_argument("--to", dest="to_flag", help=argparse.SUPPRESS)
+    # The target chat is a REQUIRED LEADING positional on every send command: the
+    # recipient comes first (like every messaging tool), and the free-form message
+    # goes last where a broken shell quote can't swallow it. There is no group
+    # default — _to() errors on omission. `--to` is an order-independent alternative.
+    def add_target(s):
+        s.add_argument("to", nargs="?",
+                       help="target chat (required): `group`/`team`, a tg.conf alias, or a numeric id")
+        s.add_argument("--to", dest="to_flag", metavar="CHAT",
+                       help="target chat as a flag (alternative to the leading positional)")
 
-    s = sub.add_parser("send"); s.add_argument("text", nargs="?"); add_to(s)
+    s = sub.add_parser("send"); add_target(s); s.add_argument("text", nargs="?")
     s.add_argument("--file", dest="text_file", help="read the message text from FILE (avoids shell-quoting traps)")
     s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
     s.add_argument("--html", action="store_true"); s.add_argument("--dry-run", dest="dry_run", action="store_true")
@@ -1416,19 +1471,20 @@ def build_parser():
     s.add_argument("--file", dest="text_file", help="read the reply text from FILE (avoids shell-quoting traps)")
     s.add_argument("--html", action="store_true")
 
-    s = sub.add_parser("sendvoice"); s.add_argument("text"); add_to(s)
+    s = sub.add_parser("sendvoice"); add_target(s); s.add_argument("text")
 
-    s = sub.add_parser("senddoc"); s.add_argument("path"); add_to(s)
+    s = sub.add_parser("senddoc"); add_target(s); s.add_argument("path")
     s.add_argument("--caption"); s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
 
-    s = sub.add_parser("sendphoto"); s.add_argument("path"); add_to(s)
+    s = sub.add_parser("sendphoto"); add_target(s); s.add_argument("path")
     s.add_argument("--caption"); s.add_argument("--html", action="store_true")
     s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
 
-    # Options are variadic, so [to] can't be a trailing positional here — target
-    # comes from --to (defaults to the group), unlike the other send* commands.
+    # Options are variadic, so the target can't be a leading positional here — it
+    # comes from --to (now required, like everywhere: no group default).
     s = sub.add_parser("sendpoll"); s.add_argument("question"); s.add_argument("options", nargs="+")
-    s.add_argument("--to", dest="to_flag", help="target chat (tg.conf alias or id); omit for the group")
+    s.add_argument("--to", dest="to_flag", metavar="CHAT",
+                   help="target chat (required): `group`/`team`, a tg.conf alias, or a numeric id")
     s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
     s.add_argument("--multi", action="store_true", help="allow multiple answers (regular poll)")
     s.add_argument("--quiz", type=int, metavar="N", help="quiz poll; N = 0-based index of the correct option")
@@ -1439,11 +1495,17 @@ def build_parser():
     s.add_argument("msg_id", nargs="?", help="the poll's message id (omit for the most recent poll)")
     s.add_argument("--poll-id", dest="poll_id", help="target by Telegram poll_id instead of message id")
 
-    s = sub.add_parser("react"); s.add_argument("msg_id"); s.add_argument("emoji", nargs="?"); add_to(s)
-    s = sub.add_parser("reactions"); add_to(s)
-    s = sub.add_parser("delete"); s.add_argument("msg_id"); add_to(s)
+    # react / delete are message-id-primary: the chat is resolved from history by
+    # msg_id (like reply), so no positional target — --to only overrides it.
+    s = sub.add_parser("react"); s.add_argument("msg_id"); s.add_argument("emoji", nargs="?")
+    s.add_argument("--to", dest="to_flag", metavar="CHAT",
+                   help="override target chat (default: the message's chat, from history)")
+    s = sub.add_parser("reactions"); add_target(s)
+    s = sub.add_parser("delete"); s.add_argument("msg_id")
+    s.add_argument("--to", dest="to_flag", metavar="CHAT",
+                   help="override target chat (default: the message's chat, from history)")
 
-    s = sub.add_parser("ack"); add_to(s)
+    s = sub.add_parser("ack"); add_target(s)
     s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
 
     s = sub.add_parser("topics"); s.add_argument("sub", nargs="?"); s.add_argument("args", nargs="*")
