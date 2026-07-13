@@ -27,6 +27,7 @@ Commands:
   senddoc <to> <path>        sendDocument — file attachment (+ --caption --topic …)
   sendphoto <to> <path>      sendPhoto — inline image    (+ --caption --html --topic …)
   sendpoll <q> <opt…>        sendPoll — question + 2-10 options (--quiz N --multi --public --topic …; target via --to)
+  polls [--days N]           every poll we sent lately + its tally (incl. the ones nobody voted on)
   pollstatus [msg_id]        per-option tally of a poll WE sent: who voted each option + which options nobody picked (needs --public); marks it reviewed
   react <msg_id> [emoji]     setMessageReaction (empty emoji clears; chat from history, --to overrides)
   reactions <to>             list the emoji this chat actually allows as reactions
@@ -49,9 +50,11 @@ target from a type word.
   media                      idempotent backfill: download media + Scribe-transcribe
   ids                        print chat ids seen in history
   pending                    the reconcile backstop — chats/threads with inbound newer than your last
-                             reply or ack, PLUS polls we sent whose votes we haven't reviewed. Votes
-                             are not messages (no chat, no text), so nothing else can surface one that
-                             landed while the Monitor was down. Run it after (re-)arming `tg watch`.
+                             reply or ack, PLUS polls whose votes you haven't reviewed. Votes are not
+                             messages (no chat, no text), so nothing else can surface one that landed
+                             while the Monitor was down. Run it after (re-)arming `tg watch`. Polls
+                             with NO votes are `tg polls`' business, not pending's — nothing arrived,
+                             so nothing was missed.
   ack <to> [--topic-id N]    mark a chat/thread SEEN (no reply needed) so it drops from `pending`
   topics [list|set <name> <id>|rm <name>|resolve <name>]
 """
@@ -1340,10 +1343,104 @@ def cmd_show(ctx, a):
         print("\n[voice transcript]\n%s" % (t.get("text") or ""))
 
 
-# How far back `pending` looks for polls still awaiting review. A poll has no
-# "closed" state we can see, so without a horizon an un-reviewed one would nag
-# forever — and a box sending a checklist every morning would accrete them.
+# How far back we look for polls. A poll has no "closed" state we can see, so
+# without a horizon the list would grow without bound on a box that sends a
+# checklist every morning.
 POLL_REVIEW_DAYS = 7
+
+
+def scan_polls(ctx, days=POLL_REVIEW_DAYS):
+    """Polls WE sent inside the window, each with its votes and its review state.
+    Returns [(sent, poll_id, out_row, votes, fresh, reviewed)] oldest-first, where
+    `votes` is {voter_id: (date, name, option_ids)} with the LATEST answer per voter
+    winning (Telegram REPLACES a voter's selection on every change; an empty list is
+    a retraction), and `fresh` counts the voters whose latest answer landed after our
+    last `tg pollstatus` of that poll.
+
+    Poll rows are keyed by poll_id, never by chat: a `poll_answer` update carries no
+    chat at all. That is the whole reason votes need their own accounting instead of
+    riding the chat-keyed message watermark."""
+    polls, votes, reviewed = {}, {}, {}
+    if not os.path.exists(ctx.hist):
+        return []
+    with open(ctx.hist, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            d = r.get("date")
+            if d is None:
+                continue
+            kind = r.get("kind")
+            if kind == "poll_answer" and r.get("poll_id"):
+                vid = (r.get("from") or {}).get("id")
+                if vid is None:
+                    continue
+                cur = votes.setdefault(r["poll_id"], {})
+                if vid not in cur or d >= cur[vid][0]:
+                    cur[vid] = (d, (r.get("from") or {}).get("first_name") or "?",
+                                r.get("option_ids") or [])
+            elif kind == "poll_seen" and r.get("poll_id"):
+                reviewed[r["poll_id"]] = max(d, reviewed.get(r["poll_id"], -1))
+            elif r.get("direction") == "out" and r.get("poll"):
+                p = r["poll"]
+                if p.get("poll_id"):
+                    polls[p["poll_id"]] = (d, r)      # a re-send of the same poll: latest wins
+    horizon = time.time() - days * 86400
+    out = []
+    for pid, (sent, r) in polls.items():
+        if sent < horizon:
+            continue
+        wm = reviewed.get(pid, -1)                    # -1 = never reviewed
+        v = votes.get(pid, {})
+        fresh = sum(1 for (d, _n, _o) in v.values() if d > wm)
+        out.append((sent, pid, r, v, fresh, wm >= 0))
+    return sorted(out)
+
+
+def _poll_line(ctx, r, v):
+    """One poll, rendered: where it went, its question, and the state of the tally."""
+    p = r["poll"]
+    options = p.get("options") or []
+    picked = {oi for (_d, _n, opts) in v.values() for oi in opts}
+    unchecked = [i for i in range(len(options)) if i not in picked]
+    voters = sum(1 for (_d, _n, opts) in v.values() if opts)   # a retracted vote isn't a voter
+    cid = (r.get("chat") or {}).get("id")
+    alias = ctx.chat_alias(cid)
+    loc = (alias + " " if alias else "") + str(cid)
+    head = "  #%-7s [%s] %s" % (r.get("message_id"), loc,
+                                (r.get("text") or "").replace("\n", " ")[:52])
+    if not voters:
+        return head, "    nobody has voted"
+    last = max(d for (d, _n, _o) in v.values())
+    return head, "    %d voter%s, %d/%d option%s unchecked, last vote %s" % (
+        voters, "" if voters == 1 else "s", len(unchecked), len(options),
+        "" if len(unchecked) == 1 else "s", _iso(last))
+
+
+def cmd_polls(ctx, a):
+    """Every poll WE sent in the last week (`--days N` to widen), with its tally:
+    how many voted, how many options nobody has ticked, when the last vote landed.
+    The standing view — "how are the checklists doing?" — as opposed to `tg pending`,
+    which only reports the votes you have NOT yet looked at. Read-only: listing a
+    poll does not mark it reviewed (only `tg pollstatus` does).
+
+    A poll with no votes is listed here but never in `pending`: nothing arrived, so
+    nothing can have been missed. An empty checklist is a shop-discipline question,
+    not a lost message."""
+    rows = scan_polls(ctx, a.days)
+    if not rows:
+        print("no polls sent in the last %d days" % a.days); return
+    print("%d poll(s) in the last %d days:" % (len(rows), a.days))
+    for _sent, _pid, r, v, fresh, was_reviewed in rows:
+        head, tally = _poll_line(ctx, r, v)
+        mark = "  ✳ %d unreviewed vote%s" % (fresh, "" if fresh == 1 else "s") if fresh else ""
+        if r["poll"].get("anonymous"):
+            mark += "  (anonymous — no voters visible)"
+        print(head)
+        print("%s%s" % (tally, mark))
+    print("→ `tg pollstatus <#id>` for the per-option tally (who ticked what)")
 
 
 def cmd_pending(ctx, _a):
@@ -1358,18 +1455,21 @@ def cmd_pending(ctx, _a):
     topics are keyed per-thread so a reply in one thread doesn't mask an unanswered
     message in another.
 
-    POLLS — polls WE sent that have votes we haven't looked at (or that nobody has
-    voted on at all). A vote is NOT a message: `poll_answer` carries no chat and no
-    text, so the reply/ack watermark above can never reach it, and a vote that lands
-    while the Monitor is down is otherwise invisible on EVERY surface — which is the
-    whole reason this section exists. `tg pollstatus <id>` is the review, and doing
-    it marks the poll seen; a vote arriving afterwards re-surfaces it. Anonymous
-    polls are skipped: Telegram never reveals their voters, so there is nothing to
-    miss and nothing to reconcile."""
+    POLLS — polls WE sent that have votes we have NOT looked at. A vote is not a
+    message: `poll_answer` carries no chat and no text, so the reply/ack watermark
+    above can never reach it, and a vote that lands while the Monitor is down is
+    otherwise invisible on EVERY surface — which is the whole reason this section
+    exists. `tg pollstatus <id>` is the review, and doing it marks the poll seen; a
+    vote arriving afterwards re-surfaces it.
+
+    A poll with NO votes is deliberately absent: nothing arrived, so nothing can
+    have been missed, and a shop that sends four checklists a morning would bury the
+    real signal under empty ones. `tg polls` is the standing view that shows those.
+    Anonymous polls never appear either — Telegram reveals no voters, so there is
+    nothing to reconcile."""
     if not os.path.exists(ctx.hist):
         print("no history yet — poll first"); return
     last_in, last_out, last_ack, who, msgs = {}, {}, {}, {}, {}
-    polls, votes, reviewed = {}, {}, {}
     with open(ctx.hist, encoding="utf-8") as f:
         for line in f:
             try:
@@ -1379,28 +1479,11 @@ def cmd_pending(ctx, _a):
             d = r.get("date")
             if d is None:                       # undated rows (failed sends, deletes) carry no ordering
                 continue
-            kind = r.get("kind")
-            # Poll rows are keyed by poll_id, not by chat: a vote has no chat at all,
-            # so they're collected here BEFORE the chat-keyed message logic below.
-            if kind == "poll_answer" and r.get("poll_id"):
-                vid = (r.get("from") or {}).get("id")
-                if vid is not None:
-                    cur = votes.setdefault(r["poll_id"], {})
-                    if vid not in cur or d >= cur[vid][0]:      # latest answer per voter wins
-                        cur[vid] = (d, r.get("option_ids") or [])
-                continue
-            if kind == "poll_seen" and r.get("poll_id"):
-                reviewed[r["poll_id"]] = max(d, reviewed.get(r["poll_id"], -1))
-                continue
             cid = (r.get("chat") or {}).get("id")
             if cid is None:
                 continue
-            if r.get("direction") == "out" and r.get("poll"):
-                p = r["poll"]
-                if p.get("poll_id"):
-                    polls[p["poll_id"]] = (d, r)                # re-send of the same poll_id: latest wins
             key = (cid, r.get("thread_id"))
-            if r.get("direction") == "in" and not kind:         # real inbound message only
+            if r.get("direction") == "in" and not r.get("kind"):   # real inbound message only
                 if d >= last_in.get(key, -1):
                     last_in[key] = d
                     who[key] = (r.get("from") or {}).get("first_name") or "?"
@@ -1408,28 +1491,19 @@ def cmd_pending(ctx, _a):
                                                  r.get("message_id")))
             elif r.get("direction") == "out":
                 last_out[key] = max(d, last_out.get(key, -1))
-            elif kind == "ack":                  # seen, no reply needed — clears like a reply
+            elif r.get("kind") == "ack":         # seen, no reply needed — clears like a reply
                 last_ack[key] = max(d, last_ack.get(key, -1))
 
     def seen(key):                               # watermark: replied-to OR acked, whichever is later
         return max(last_out.get(key, -1), last_ack.get(key, -1))
     rows = [(din, key) for key, din in last_in.items() if din > seen(key)]
-
-    horizon = time.time() - POLL_REVIEW_DAYS * 86400
-    open_polls = []
-    for pid, (sent, r) in polls.items():
-        p = r["poll"]
-        if p.get("anonymous") or sent < horizon:
-            continue
-        wm = reviewed.get(pid, -1)               # -1 = never reviewed
-        v = votes.get(pid, {})
-        fresh = sum(1 for (d, _o) in v.values() if d > wm)
-        if wm >= 0 and not fresh:                # reviewed, and nothing new since
-            continue
-        open_polls.append((sent, pid, r, v, fresh, wm < 0))
+    # Only polls with votes we haven't reviewed: those are the ones a dropped Monitor
+    # could have swallowed. No votes ⇒ nothing was missed ⇒ not pending (see `tg polls`).
+    open_polls = [t for t in scan_polls(ctx)
+                  if t[4] and not t[2]["poll"].get("anonymous")]
 
     if not rows and not open_polls:
-        print("all caught up — no unanswered inbound, no polls awaiting review"); return
+        print("all caught up — no unanswered inbound, no unreviewed poll votes"); return
 
     for din, key in sorted(rows):
         cid, tid = key
@@ -1448,23 +1522,11 @@ def cmd_pending(ctx, _a):
         return
     if rows:
         print()
-    print("polls awaiting review (%d):" % len(open_polls))
-    for sent, _pid, r, v, fresh, never in sorted(open_polls):
-        p = r["poll"]
-        options = p.get("options") or []
-        picked = {oi for (_d, opts) in v.values() for oi in opts}
-        unchecked = [i for i in range(len(options)) if i not in picked]
-        voters = sum(1 for (_d, opts) in v.values() if opts)   # a retracted vote isn't a voter
-        cid = (r.get("chat") or {}).get("id")
-        alias = ctx.chat_alias(cid)
-        loc = (alias + " " if alias else "") + str(cid)
-        last = max([d for (d, _o) in v.values()], default=None)
-        when = datetime.datetime.fromtimestamp(last, datetime.UTC).isoformat() if last else "—"
-        tally = "no votes at all" if not voters else "%d voter%s (%d new), %d/%d option%s unchecked, last vote %s" % (
-            voters, "" if voters == 1 else "s", fresh,
-            len(unchecked), len(options), "" if len(unchecked) == 1 else "s", when)
-        print("  #%-9s [%s] %s" % (r.get("message_id"), loc, (r.get("text") or "").replace("\n", " ")[:60]))
-        print("    %s%s" % (tally, "  (never reviewed)" if never else ""))
+    print("polls with unreviewed votes (%d):" % len(open_polls))
+    for _sent, _pid, r, v, fresh, was_reviewed in open_polls:
+        head, tally = _poll_line(ctx, r, v)
+        print(head)
+        print("%s  ← %d unreviewed%s" % (tally, fresh, "" if was_reviewed else ", never reviewed"))
     print("→ `tg pollstatus <#id>` for the per-option tally — reviewing it marks it seen")
 
 
@@ -1590,6 +1652,10 @@ def build_parser():
     s = sub.add_parser("pollstatus")
     s.add_argument("msg_id", nargs="?", help="the poll's message id (omit for the most recent poll)")
     s.add_argument("--poll-id", dest="poll_id", help="target by Telegram poll_id instead of message id")
+
+    s = sub.add_parser("polls")
+    s.add_argument("--days", type=int, default=POLL_REVIEW_DAYS, metavar="N",
+                   help="how far back to look (default: %d)" % POLL_REVIEW_DAYS)
 
     # react / delete are message-id-primary: the chat is resolved from history by
     # msg_id (like reply), so no positional target — --to only overrides it.
