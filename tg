@@ -545,17 +545,28 @@ def inbound_messages(rows):
 
 
 def first_arrival(rows):
-    """{message_id: chat_id} for the EARLIEST inbound message with each id.
+    """{message_id: chat_id} for the earliest inbound message with each id THAT COULD
+    OWN A TRANSCRIPT — one carrying transcribable media.
 
     Only for reading pre-2026-07-28 data. Back then media download and
     transcription were both gated on the bare id, so whichever message arrived
     first is the one that actually got its bytes and its transcript — the later
     same-numbered ones were skipped. That makes the earliest arrival the correct
     owner of any legacy artefact, and it is why `migrate` can place them without
-    guessing."""
+    guessing.
+
+    Restricting to media messages is load-bearing, not tidiness: ids are shared
+    with ordinary TEXT messages too, and taking the earliest message of any kind
+    hands a legacy transcript to a text message in another chat. The real voice
+    note then looks untranscribed and is sent to the ASR again. That is not
+    hypothetical — it is what this function did on its first deploy: an 82s video
+    was re-transcribed and re-billed, and a 1s clip came back with a different
+    wrong word than the first run."""
     best = {}
     for r in rows:
         if not is_message(r):
+            continue
+        if (r.get("media") or {}).get("type") not in _TRANSCRIBE:
             continue
         cid = (r.get("chat") or {}).get("id")
         mid = r.get("message_id")
