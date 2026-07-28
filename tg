@@ -74,7 +74,7 @@ chat_id). Never infer a target from a type word.
   ack <to> [--topic-id N|--all-threads]  mark a chat/thread SEEN (no reply needed) so it drops from `pending`
   topics [list|set <name> <id>|rm <name>|resolve <name>]
 """
-import sys, os, json, re, time, uuid, signal, datetime, mimetypes, subprocess
+import sys, os, json, re, time, uuid, signal, datetime, mimetypes, subprocess, filecmp
 import socket, threading, http.client
 import urllib.request, urllib.parse
 
@@ -1652,7 +1652,7 @@ def cmd_migrate(ctx, a):
     for v in list(owners.values()) + list(audio.values()):
         v.sort()
 
-    moved, skipped = [], []
+    moved, skipped, removed = [], [], []
     for name in legacy_media(ctx):
         src = os.path.join(ctx.media, name)
         stem, dot, ext = name.rpartition(".")
@@ -1673,7 +1673,19 @@ def cmd_migrate(ctx, a):
         cid = cands[0][1]
         dest = media_path(ctx, cid, mid, ext)
         if os.path.exists(dest):
-            skipped.append((name, "already at %s" % os.path.relpath(dest, ctx.root))); continue
+            # Normal once a poller running the new code has already backfilled this
+            # message: the same bytes now exist at the correct path. Byte-identical
+            # ⇒ the flat copy is provably redundant, so remove it — leaving it would
+            # strand it forever and keep `doctor` warning about a layout that is in
+            # fact complete. Differing bytes are NOT ours to resolve: report and keep.
+            if filecmp.cmp(src, dest, shallow=False):
+                if not a.dry_run:
+                    os.remove(src)
+                removed.append((name, os.path.relpath(dest, ctx.root)))
+            else:
+                skipped.append((name, "DIFFERS from %s — kept, needs a human"
+                                % os.path.relpath(dest, ctx.root)))
+            continue
         if not a.dry_run:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             os.rename(src, dest)
@@ -1689,6 +1701,13 @@ def cmd_migrate(ctx, a):
     print("migrate: %s %d file(s)" % (verb, len(moved)))
     for name, ref, dest in moved:
         print("    %-16s %-24s -> %s" % (name, ref, dest))
+    if removed:
+        print("  %s %d redundant copy/copies (identical file already in place):"
+              % ("would remove" if a.dry_run else "removed", len(removed)))
+        for name, dest in removed[:5]:
+            print("    %-16s == %s" % (name, dest))
+        if len(removed) > 5:
+            print("    … and %d more" % (len(removed) - 5))
     if skipped:
         print("  %d left in place:" % len(skipped))
         for name, why in skipped:
