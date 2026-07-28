@@ -746,12 +746,38 @@ def transcribe_lang(ctx, cid):
     return _chat_cfg(ctx, cid, "TG_TRANSCRIBE_LANG")
 
 
+# ISO 639-2/3 → 639-1. Scribe answers in three-letter codes ("fra", "por"), config
+# is written in two ("fr", "pt"), and the two only coincide sometimes: fra→fr and
+# eng→en survive a naive truncation, but por→"po" and spa→"sp" do not. Truncating
+# would have flagged every Portuguese note in a French/Portuguese kitchen as
+# implausible — a false alarm on half the traffic, which is how a warning becomes
+# noise and then becomes ignored.
+_LANG3 = {
+    "fra": "fr", "fre": "fr", "por": "pt", "eng": "en", "deu": "de", "ger": "de",
+    "spa": "es", "ita": "it", "nld": "nl", "dut": "nl", "pol": "pl", "tur": "tr",
+    "ind": "id", "vie": "vi", "swe": "sv", "dan": "da", "nor": "no", "nob": "no",
+    "fin": "fi", "ces": "cs", "cze": "cs", "ron": "ro", "rum": "ro", "hun": "hu",
+    "cat": "ca", "afr": "af", "rus": "ru", "ukr": "uk", "bul": "bg", "srp": "sr",
+    "ara": "ar", "fas": "fa", "per": "fa", "urd": "ur", "heb": "he", "hin": "hi",
+    "tha": "th", "kor": "ko", "zho": "zh", "chi": "zh", "jpn": "ja", "ell": "el",
+    "gre": "el",
+}
+
+
+def norm_lang(code):
+    """Any language code → its two-letter form, or None."""
+    c = (code or "").strip().lower().replace("_", "-").split("-")[0]
+    if not c:
+        return None
+    return c if len(c) == 2 else _LANG3.get(c, c[:2])
+
+
 def expected_langs(ctx, cid):
     """Languages this chat can plausibly be in. An explicit TG_TRANSCRIBE_EXPECT
     wins; otherwise a forced language implies itself. Empty ⇒ no expectation
     declared ⇒ we make no claim and flag nothing on these grounds."""
     v = _chat_cfg(ctx, cid, "TG_TRANSCRIBE_EXPECT") or transcribe_lang(ctx, cid)
-    return [x.strip().lower()[:2] for x in (v or "").replace(";", ",").split(",") if x.strip()]
+    return [x for x in (norm_lang(p) for p in (v or "").replace(";", ",").split(",")) if x]
 
 
 def dominant_script(text):
@@ -774,7 +800,7 @@ def transcript_flags(ctx, cid, duration, res, forced):
     if isinstance(conf, (int, float)) and conf < floor:
         flags.append("language %.0f%% sure%s" % (conf * 100, " on a %ds clip" % duration if short else ""))
     expect = expected_langs(ctx, cid)
-    det = (res.get("detected_lang") or "").lower()[:2]
+    det = norm_lang(res.get("detected_lang"))
     if expect and det and det not in expect:
         flags.append("detected %s, expected %s" % (det, "/".join(expect)))
     if expect:
