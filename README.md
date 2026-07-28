@@ -189,6 +189,25 @@ log for the rest of a message. An edited message shows its current text, flagged
 separated, each with its own transcript attached — a transcript is never rendered
 under another message's header.
 
+**Reconciling — `pending` and `ack`.** `pending` lists every (chat, thread) whose
+newest inbound is newer than your newest reply **or** ack there. A thread is its
+own scope, so `tg ack <chat>` clears the chat's main timeline and *not* its
+threads — correct, but easy to read as a broken tool, so an ack that leaves
+anything open in the same chat now names it and the command that finishes it.
+`--all-threads` does the whole chat at once.
+
+Note what counts as a "thread". In a supergroup, replying to a message makes
+Telegram open a message thread rooted on it, so `thread_id` is often a **reply
+chain**, not a forum topic — an active chat can therefore accumulate many small
+pending scopes, each needing its own ack. That is deliberate (a reply chain is a
+conversation you may still owe an answer to), and `--all-threads` is the bulk
+clear when it isn't.
+
+A reply sent *into* a thread does clear it: Telegram returns `message_thread_id`
+on the sent message and the outbound row records it, so the watermark lands in the
+right scope. If a thread ever looks stuck despite a reply, check that first —
+it means the outbound row landed in the `(chat, None)` scope instead.
+
 **Polls:** `tg sendpoll "Lunch?" Pizza Sushi Salad --to group` posts a regular,
 **anonymous** poll to the group. `--multi` allows multiple answers; `--public`
 makes votes non-anonymous; `--quiz N` turns it into a quiz with the 0-based
