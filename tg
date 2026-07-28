@@ -7,13 +7,27 @@ the Telegram Bot API getUpdates long-poll (the only transport any of them used).
 The *code* is shared and global; the *state* and *config* are per-repo, resolved
 from the repo you're standing in:
 
-  state   <repo>/var/telegram/   history.jsonl · offset · poller.pid · poller.beat · media/ · topics.json
-  config  <repo>/tg.conf         GROUP=... + UPPERCASE chat aliases + TG_TRANSCRIBE_LANG (optional)
+  state   <repo>/var/telegram/   history.jsonl · offset · poller.pid · poller.beat · media/<chat_id>/ · topics.json
+  config  <repo>/tg.conf         GROUP=... + UPPERCASE chat aliases + TG_TRANSCRIBE_* (optional)
           env / .env             secrets: TG_BOT_TOKEN, TG_ELEVENLABS_KEY (optional)
+
+A MESSAGE IS IDENTIFIED BY (chat_id, message_id), never by the id alone — a
+Telegram message_id is unique only within its chat, so #1746 in the group and
+#1746 in a DM are different messages. Refs are written `<chat>:<id>` —
+`GROUP:1746`, `-1004412570945:1746` — and that is what every surface prints. A
+bare `1746` still works and is resolved: unique ⇒ fine, ambiguous ⇒ writes
+(reply/react/delete) REFUSE and list the candidates, while `show` prints them
+all. Media lives at `media/<chat_id>/<msg_id>.<ext>` for the same reason; `tg
+migrate` moves a pre-2026-07-28 repo into that layout.
 
 Audio is always downloaded; transcription (ElevenLabs Scribe) is layered on top
 only when TG_ELEVENLABS_KEY is present. Language auto-detects unless
-TG_TRANSCRIBE_LANG forces one — so a multilingual group (de/en/pt-BR) just works.
+TG_TRANSCRIBE_LANG forces one — globally, or per chat as
+TG_TRANSCRIBE_LANG_<ALIAS> — so a multilingual group (de/en/pt-BR) just works
+while a one-language DM can be pinned. Transcripts carry the engine's own
+language + confidence, and are FLAGGED (never dropped) when the detected
+language or writing system can't be right for the chat — declare what a chat
+can plausibly be with TG_TRANSCRIBE_EXPECT=fr,pt,en.
 
 history.jsonl is an append-only in+out conversation log with a stable schema (safe to tail).
 
@@ -22,16 +36,17 @@ Commands:
   doctor                     (re)start the poller detached if dead
   watch                      doctor + watchdog + follow history.jsonl -> Monitor stream
   send <to> <text|--file F>  sendMessage   (+ --topic <name>|--topic-id <n> --html --dry-run)
-  reply <msg_id> <text|--file F>  reply IN the originating chat (resolved from history) + thread it (+ --html)
+  reply <ref> <text|--file F>  reply IN the originating chat (resolved from history) + thread it (+ --html)
+  show <ref>                 the full stored record of a message (text, media, transcript)
   sendvoice <to> <text>      ElevenLabs TTS -> opus -> sendVoice
   senddoc <to> <path>        sendDocument — file attachment (+ --caption --topic …)
   sendphoto <to> <path>      sendPhoto — inline image    (+ --caption --html --topic …)
   sendpoll <q> <opt…>        sendPoll — question + 2-10 options (--quiz N --multi --public --topic …; target via --to)
   polls [--days N]           every poll we sent lately + its tally (incl. the ones nobody voted on)
   pollstatus [msg_id]        per-option tally of a poll WE sent: who voted each option + which options nobody picked (needs --public); marks it reviewed
-  react <msg_id> [emoji]     setMessageReaction (empty emoji clears; chat from history, --to overrides)
+  react <ref> [emoji]        setMessageReaction (empty emoji clears; chat from the ref/history, --to overrides)
   reactions <to>             list the emoji this chat actually allows as reactions
-  delete <msg_id>            deleteMessage + synthetic 'deleted' history row (chat from history, --to overrides)
+  delete <ref>               deleteMessage + synthetic 'deleted' history row (chat from the ref/history, --to overrides)
 
 The target chat <to> is a REQUIRED LEADING positional on every send command — the
 recipient comes first (like every messaging tool), and the free-form message goes
@@ -43,11 +58,12 @@ reply/react/delete take no target — they resolve the chat from the message id 
 history (react/delete accept --to to override).
 
 `watch`/`pending` name each inbound channel by IDENTITY and carry its chat_id —
-"MSG [BACKOFFICE -5470784074] Jerome #156: …" — so two same-type chats never
-collide and a reply targets the right one mechanically: `tg reply 156 <text>`
-(by the `#<id>`) or `tg send -5470784074 <text>` (by the chat_id). Never infer a
-target from a type word.
+"MSG [BACKOFFICE -5470784074] Jerome #BACKOFFICE:156: …" — so two same-type chats
+never collide and a reply targets the right one mechanically: `tg reply
+BACKOFFICE:156 <text>` (by the ref) or `tg send -5470784074 <text>` (by the
+chat_id). Never infer a target from a type word.
   media                      idempotent backfill: download media + Scribe-transcribe
+  migrate                    move legacy media/<msg_id>.<ext> -> media/<chat_id>/<msg_id>.<ext> (--dry-run)
   ids                        print chat ids seen in history
   pending                    the reconcile backstop — chats/threads with inbound newer than your last
                              reply or ack, PLUS polls whose votes you haven't reviewed. Votes are not
@@ -55,7 +71,7 @@ target from a type word.
                              while the Monitor was down. Run it after (re-)arming `tg watch`. Polls
                              with NO votes are `tg polls`' business, not pending's — nothing arrived,
                              so nothing was missed.
-  ack <to> [--topic-id N]    mark a chat/thread SEEN (no reply needed) so it drops from `pending`
+  ack <to> [--topic-id N|--all-threads]  mark a chat/thread SEEN (no reply needed) so it drops from `pending`
   topics [list|set <name> <id>|rm <name>|resolve <name>]
 """
 import sys, os, json, re, time, uuid, signal, datetime, mimetypes, subprocess
@@ -438,11 +454,205 @@ def ingest(ctx, body):
     return True
 
 
+# ── message identity: (chat_id, message_id) ───────────────────────────────────
+#
+# A Telegram message_id is unique only WITHIN its chat. #1746 in the staff group
+# and #1746 in a DM are two unrelated messages. Anything keyed on the id alone
+# therefore conflates them, and every symptom of that is SILENT — nothing raises,
+# you simply get someone else's content:
+#
+#   • media   — the second arrival finds its path taken, so its bytes are never
+#               written and the file holds the first sender's photo/voice
+#   • text    — `show` printed one message's header above another's transcript
+#   • WRITES  — `reply` resolved the chat from the newest row with that id, so a
+#               reply to a DM could be delivered into the group
+#
+# All three were live in production until 2026-07-28. The third is the serious
+# one: it is the same private-DM-into-the-staff-group leak `_to()` was hardened
+# against, closed at the target-argument door and left open at the message-id one.
+#
+# So: the identity of a message is the pair (chat_id, message_id), everywhere,
+# with no exceptions. thread_id is deliberately NOT part of it — a thread is an
+# attribute of a message, not a namespace for its id, and folding it in would
+# invent a second way to miss (a message whose thread we failed to record).
+#
+# Textual form: `<chat>:<msg_id>` — `GROUP:1746`, `-1004412570945:1746`. Every
+# surface that PRINTS an id prints it qualified, so anything copy-pasted out of
+# `watch` / `pending` is unambiguous by construction. A bare `1746` is still
+# accepted — it is what a human reads off a screen — but it is RESOLVED, never
+# guessed: unique ⇒ fine, ambiguous ⇒ the command refuses and lists the
+# candidates. Refusing is the point. "Pick the newest and mention it in the
+# output" is the silent-wrong-answer this replaces: the caller is usually a
+# model, and a caveat printed beside plausible-looking content is exactly what
+# gets skimmed past.
+
+_REF_RE = re.compile(r"^(?P<chat>[^:#\s]+[:#])?#?(?P<mid>\d+)$")
+
+
+def parse_ref(raw, cmd):
+    """`1746` / `#1746` / `GROUP:1746` / `-1004412570945:1746` → (chat_spec|None, id).
+    chat_spec is left symbolic here; resolve_chat() turns it into an id, so an
+    alias works anywhere a raw id does."""
+    m = _REF_RE.match(str(raw).strip())
+    if not m:
+        die("%s: %r is not a message ref — pass the bare id (1746) or the qualified "
+            "form (GROUP:1746 / -1004412570945:1746) that watch/pending print" % (cmd, raw), 2)
+    chat = m.group("chat")
+    return (chat[:-1] if chat else None), int(m.group("mid"))
+
+
+def ref_str(ctx, cid, mid):
+    """The canonical printable ref. Alias when the repo names the chat, raw id
+    otherwise — either way it round-trips back through parse_ref/resolve_chat."""
+    return "%s:%s" % (ctx.chat_alias(cid) or cid, mid)
+
+
+def load_rows(ctx):
+    """history.jsonl as a list, once. Commands used to re-open and re-parse it per
+    concern; a single read keeps every view of a message consistent within one run."""
+    if not os.path.exists(ctx.hist):
+        return []
+    out = []
+    with open(ctx.hist, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def is_message(r):
+    """A real inbound message — not a reaction / membership / transcript / poll_answer."""
+    return r.get("direction") == "in" and not r.get("kind")
+
+
+def inbound_messages(rows):
+    """{(chat_id, message_id): row} — the latest row per identity wins, because
+    append-only means an edit lands later under the same identity and supersedes."""
+    out = {}
+    for r in rows:
+        if not is_message(r):
+            continue
+        cid = (r.get("chat") or {}).get("id")
+        mid = r.get("message_id")
+        if cid is not None and mid is not None:
+            out[(cid, mid)] = r
+    return out
+
+
+def first_arrival(rows):
+    """{message_id: chat_id} for the EARLIEST inbound message with each id.
+
+    Only for reading pre-2026-07-28 data. Back then media download and
+    transcription were both gated on the bare id, so whichever message arrived
+    first is the one that actually got its bytes and its transcript — the later
+    same-numbered ones were skipped. That makes the earliest arrival the correct
+    owner of any legacy artefact, and it is why `migrate` can place them without
+    guessing."""
+    best = {}
+    for r in rows:
+        if not is_message(r):
+            continue
+        cid = (r.get("chat") or {}).get("id")
+        mid = r.get("message_id")
+        if cid is None or mid is None:
+            continue
+        d = r.get("date") or 0
+        if mid not in best or d < best[mid][0]:
+            best[mid] = (d, cid)
+    return {mid: cid for mid, (_d, cid) in best.items()}
+
+
+def _preview(r, width=48):
+    t = (r.get("text") or "").replace("\n", " ").strip()
+    if not t:
+        med = r.get("media") or {}
+        t = "[%s%s]" % (med.get("type", "non-text"), _dur(med.get("duration"))) if med else "[non-text]"
+    return t[:width]
+
+
+def find_ref(ctx, raw, cmd, rows=None):
+    """Every inbound message a ref names, oldest first. Never empty: an unknown ref
+    is a hard error, since acting on "no such message" is always a mistake."""
+    chat_spec, mid = parse_ref(raw, cmd)
+    msgs = inbound_messages(rows if rows is not None else load_rows(ctx))
+    hits = [(cid, r) for (cid, m), r in msgs.items() if m == mid]
+    if chat_spec is not None:
+        want = int(ctx.resolve_chat(chat_spec))
+        hits = [h for h in hits if h[0] == want]
+        if not hits:
+            die("%s: no inbound message %s in history — check the chat, or poll first"
+                % (cmd, ref_str(ctx, want, mid)), 2)
+    if not hits:
+        die("%s: no inbound message #%s in any chat in history (poll first?)" % (cmd, mid), 2)
+    hits.sort(key=lambda h: h[1].get("date") or 0)
+    return [r for _cid, r in hits]
+
+
+def resolve_ref(ctx, raw, cmd, rows=None):
+    """Exactly one message, or a hard error listing the candidates. The primitive
+    for anything that ACTS on a message (reply / react / delete): a write into the
+    wrong chat cannot be taken back, so ambiguity fails closed rather than
+    resolving to a best guess."""
+    hits = find_ref(ctx, raw, cmd, rows)
+    if len(hits) == 1:
+        return hits[0]
+    _mid = hits[0].get("message_id")
+    lines = ["%s: #%s is ambiguous — %d chats hold a message with that id, and "
+             "picking one for you is how a DM ends up in the group:" % (cmd, _mid, len(hits))]
+    for r in hits:
+        cid = (r.get("chat") or {}).get("id")
+        lines.append("      %-26s %-12s %s  %s" % (
+            ref_str(ctx, cid, _mid), (r.get("from") or {}).get("first_name") or "?",
+            r.get("iso") or "?", _preview(r)))
+    lines.append("  name the one you mean: `tg %s %s …`"
+                 % (cmd, ref_str(ctx, (hits[-1].get("chat") or {}).get("id"), _mid)))
+    die("\n".join(lines), 2)
+
+
 # ── media backfill + transcription (ElevenLabs Scribe) ────────────────────────
 
 _EXT = {"voice": "ogg", "audio": "mp3", "video_note": "mp4", "video": "mp4",
         "animation": "mp4", "photo": "jpg", "sticker": "webp"}
 _TRANSCRIBE = {"voice", "audio", "video_note", "video"}
+
+
+def media_ext(med):
+    """A document keeps its own extension; everything else takes its type default."""
+    if med.get("type") == "document" and med.get("file_name") and "." in med["file_name"]:
+        return med["file_name"].rsplit(".", 1)[-1].lower()
+    return _EXT.get(med.get("type"), "bin")
+
+
+def media_path(ctx, cid, mid, ext):
+    """`media/<chat_id>/<message_id>.<ext>` — pure, no mkdir, so `migrate` can
+    compute destinations freely.
+
+    The chat directory is the whole fix: it is what keeps two same-numbered
+    messages from different chats off one path. A chat DIRECTORY rather than a
+    `<chat>_<msg>` filename prefix, because chat ids are negative and a file
+    named `-1004412570945_1746.ogg` starts with a dash — every bare `cat`/`rm` of
+    it would parse as flags. Inside a directory the dash never leads the argument."""
+    return os.path.join(ctx.media, str(cid), "%s.%s" % (mid, ext))
+
+
+def transcript_key(r, legacy_owner):
+    """(chat_id, message_id) a transcript row belongs to.
+
+    Rows written from 2026-07-28 carry their own `chat`, like every other row.
+    LEGACY rows carry only `ref_message_id`, so they are attributed to the first
+    arrival (see first_arrival) — correct by construction, not a guess."""
+    mid = r.get("ref_message_id")
+    if mid is None:
+        return None
+    cid = (r.get("chat") or {}).get("id")
+    if cid is None:
+        cid = legacy_owner.get(mid)
+    return None if cid is None else (cid, mid)
 
 
 def _eleven_key(ctx):
@@ -456,13 +666,124 @@ def _has_eleven(ctx):
     return bool(ctx.get("TG_ELEVENLABS_KEY"))
 
 
-def transcribe(ctx, path):
+# ── transcript trust ──────────────────────────────────────────────────────────
+#
+# A transcript is ASR output, not typed words, and the failure that matters is
+# not a garbled string (obvious) but a CONFIDENT WRONG WORD (invisible). Short
+# clips are where it happens: 1-4s gives language auto-detection almost nothing
+# to lock onto, so "tahine" came back as taurine / tarine / farine, and one 2s
+# note came back in Arabic script from a French/Portuguese kitchen. The farine
+# one mattered — flour in the hummus would have cost the batch.
+#
+# Three levers, in order of how much they cost the caller:
+#
+#   1. FORCE the language per chat (TG_TRANSCRIBE_LANG_<ALIAS>) instead of only
+#      globally. A shop can mix fr/pt/en across chats while one person's DM is
+#      reliably one language — that is where auto-detect is pure downside.
+#   2. KEEP what the engine already tells us. We were parsing `text` out of the
+#      response and dropping language_code / language_probability on the floor —
+#      i.e. throwing away the exact confidence signal, then wishing for it.
+#   3. FLAG the implausible: a detected language or a writing system that cannot
+#      be right for this chat (TG_TRANSCRIBE_EXPECT=fr,pt,en). Flag, never drop —
+#      a suppressed transcript is a message nobody reads, which is worse than a
+#      wrong one somebody can see is wrong.
+#
+# Short clips raise the confidence BAR rather than raising a flag of their own:
+# most 2s notes ("oui", "ok") transcribe perfectly, and warning on all of them
+# trains the reader to ignore the warning — the same way a permanently-stuck
+# `pending` entry trains you to ignore `pending`.
+
+SHORT_CLIP_SECS = 3
+LANG_CONF_FLOOR = 0.5
+LANG_CONF_FLOOR_SHORT = 0.8      # auto-detect on a few seconds of audio: demand more
+
+_SCRIPTS = [
+    ("arabic", r"[؀-ۿݐ-ݿ]"), ("hebrew", r"[֐-׿]"),
+    ("cyrillic", r"[Ѐ-ӿ]"), ("greek", r"[Ͱ-Ͽ]"),
+    ("devanagari", r"[ऀ-ॿ]"), ("thai", r"[฀-๿]"),
+    ("hangul", r"[가-힯ᄀ-ᇿ]"),
+    ("cjk", r"[一-鿿぀-ヿ]"),
+    ("latin", r"[A-Za-zÀ-ɏ]"),
+]
+_LANG_SCRIPT = {
+    "fr": "latin", "pt": "latin", "en": "latin", "de": "latin", "es": "latin",
+    "it": "latin", "nl": "latin", "pl": "latin", "tr": "latin", "id": "latin",
+    "vi": "latin", "sv": "latin", "da": "latin", "no": "latin", "fi": "latin",
+    "cs": "latin", "ro": "latin", "hu": "latin", "ca": "latin", "af": "latin",
+    "ru": "cyrillic", "uk": "cyrillic", "bg": "cyrillic", "sr": "cyrillic",
+    "ar": "arabic", "fa": "arabic", "ur": "arabic", "he": "hebrew",
+    "hi": "devanagari", "th": "thai", "ko": "hangul", "zh": "cjk", "ja": "cjk",
+    "el": "greek",
+}
+
+
+def _chat_cfg(ctx, cid, base):
+    """Per-chat config with a global fallback: `<BASE>_<ALIAS>`, then `<BASE>_<chat_id>`,
+    then `<BASE>`. The alias form is the one to use — a raw chat id is negative, so
+    `TG_TRANSCRIBE_LANG_-100…` is legal in tg.conf but not as a shell env var."""
+    alias = ctx.chat_alias(cid)
+    for key in ([("%s_%s" % (base, alias))] if alias else []) + \
+               ([("%s_%s" % (base, cid))] if cid is not None else []) + [base]:
+        v = (ctx.get(key) or "").strip()
+        if v:
+            return v
+    return None
+
+
+def transcribe_lang(ctx, cid):
+    """Forced language for a chat, or None to let the engine auto-detect."""
+    return _chat_cfg(ctx, cid, "TG_TRANSCRIBE_LANG")
+
+
+def expected_langs(ctx, cid):
+    """Languages this chat can plausibly be in. An explicit TG_TRANSCRIBE_EXPECT
+    wins; otherwise a forced language implies itself. Empty ⇒ no expectation
+    declared ⇒ we make no claim and flag nothing on these grounds."""
+    v = _chat_cfg(ctx, cid, "TG_TRANSCRIBE_EXPECT") or transcribe_lang(ctx, cid)
+    return [x.strip().lower()[:2] for x in (v or "").replace(";", ",").split(",") if x.strip()]
+
+
+def dominant_script(text):
+    """The writing system most of the letters belong to, or None if there are none."""
+    best, best_n = None, 0
+    for name, pat in _SCRIPTS:
+        n = len(re.findall(pat, text))
+        if n > best_n:
+            best, best_n = name, n
+    return best
+
+
+def transcript_flags(ctx, cid, duration, res, forced):
+    """Reasons to distrust this transcript, as short human strings. Empty = nothing
+    detectably wrong (NOT a promise that it is right)."""
+    flags = []
+    short = isinstance(duration, int) and duration <= SHORT_CLIP_SECS
+    conf = res.get("lang_confidence")
+    floor = LANG_CONF_FLOOR_SHORT if (short and not forced) else LANG_CONF_FLOOR
+    if isinstance(conf, (int, float)) and conf < floor:
+        flags.append("language %.0f%% sure%s" % (conf * 100, " on a %ds clip" % duration if short else ""))
+    expect = expected_langs(ctx, cid)
+    det = (res.get("detected_lang") or "").lower()[:2]
+    if expect and det and det not in expect:
+        flags.append("detected %s, expected %s" % (det, "/".join(expect)))
+    if expect:
+        want = {_LANG_SCRIPT[l] for l in expect if l in _LANG_SCRIPT}
+        got = dominant_script(res.get("text") or "")
+        if want and got and got not in want:
+            flags.append("%s script in a %s chat" % (got, "/".join(sorted(want))))
+    return flags
+
+
+def transcribe(ctx, path, lang=None):
+    """Audio → {text, detected_lang, lang_confidence}. Returns the engine's own
+    language metadata alongside the words; whether a given Scribe model populates
+    it is not something we can assume, so absent fields stay None and the flags
+    that depend on them simply don't fire."""
     fname = os.path.basename(path)
     ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
     with open(path, "rb") as fh:
         data = fh.read()
     fields = {"model_id": "scribe_v2"}
-    lang = ctx.get("TG_TRANSCRIBE_LANG")   # unset => Scribe auto-detects (language-agnostic)
     if lang:
         fields["language_code"] = lang
     j = api_post_multipart_raw(
@@ -472,7 +793,8 @@ def transcribe(ctx, path):
     txt = (j.get("text") or "").strip()
     if not txt:
         raise RuntimeError("empty transcript: %s" % json.dumps(j)[:300])
-    return txt
+    return {"text": txt, "detected_lang": j.get("language_code"),
+            "lang_confidence": j.get("language_probability")}
 
 
 def api_post_multipart_raw(url, fields, files, headers, timeout=120):
@@ -500,61 +822,71 @@ def tts(ctx, text, out_path):
 
 
 def fetch_media(ctx):
-    if not os.path.exists(ctx.hist):
+    """Idempotent backfill: download every inbound attachment we haven't got, and
+    transcribe the audio ones. Both steps are keyed on (chat_id, message_id) — on
+    the bare id they used to collide, and a collision meant the second message was
+    quietly skipped for BOTH, leaving the first sender's file and words sitting
+    under the second sender's name."""
+    rows = load_rows(ctx)
+    if not rows:
         return
-    rows, transcribed = [], set()
-    with open(ctx.hist, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            rows.append(r)
-            if r.get("kind") == "transcript" and r.get("ref_message_id"):
-                transcribed.add(r["ref_message_id"])
+    legacy_owner = first_arrival(rows)
+    transcribed = set()
     for r in rows:
-        if r.get("direction") != "in":
+        if r.get("kind") == "transcript":
+            k = transcript_key(r, legacy_owner)
+            if k:
+                transcribed.add(k)
+    for r in rows:
+        if not is_message(r):
             continue
         med = r.get("media")
         if not med or not med.get("file_id"):
             continue
+        cid = (r.get("chat") or {}).get("id")
         mid = r.get("message_id")
-        ext = _EXT.get(med["type"], "bin")
-        if med["type"] == "document" and med.get("file_name") and "." in med["file_name"]:
-            ext = med["file_name"].rsplit(".", 1)[-1].lower()
-        dest = os.path.join(ctx.media, "%s.%s" % (mid, ext))
+        if cid is None or mid is None:
+            continue
+        ref = ref_str(ctx, cid, mid)
+        dest = media_path(ctx, cid, mid, media_ext(med))
         if not os.path.exists(dest):
             try:
                 j = api_get(ctx, "getFile", {"file_id": med["file_id"]})
                 if not j.get("ok"):
                     raise RuntimeError("getFile: %s" % j.get("description"))
                 data = _http("%s/%s" % (ctx.filebase, j["result"]["file_path"]))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with open(dest, "wb") as out:
                     out.write(data)
-                sys.stderr.write("media: saved msg %s -> %s (%d bytes)\n" % (mid, dest, len(data)))
+                sys.stderr.write("media: saved %s -> %s (%d bytes)\n" % (ref, dest, len(data)))
             except Exception as e:
-                sys.stderr.write("media: FAILED msg %s: %s\n" % (mid, e))
+                sys.stderr.write("media: FAILED %s: %s\n" % (ref, e))
                 continue
-        if med["type"] in _TRANSCRIBE and mid not in transcribed:
+        if med["type"] in _TRANSCRIBE and (cid, mid) not in transcribed:
             if not _has_eleven(ctx):
                 continue  # bytes are downloaded; transcription needs a key — skip quietly
+            forced = transcribe_lang(ctx, cid)
             try:
-                txt = transcribe(ctx, dest)
+                res = transcribe(ctx, dest, forced)
             except Exception as e:
-                sys.stderr.write("transcribe: FAILED msg %s: %s\n" % (mid, e))
+                sys.stderr.write("transcribe: FAILED %s: %s\n" % (ref, e))
                 continue
+            txt = res["text"]
+            flags = transcript_flags(ctx, cid, (med or {}).get("duration"), res, forced)
             with open(os.path.splitext(dest)[0] + ".txt", "w", encoding="utf-8") as tf:
                 tf.write(txt)
-            meta = {"direction": "meta", "kind": "transcript", "ref_message_id": mid,
+            meta = {"direction": "meta", "kind": "transcript",
+                    "chat": {"id": cid}, "ref_message_id": mid,
                     "date": int(time.time()), "engine": "elevenlabs:scribe_v2",
-                    "lang": ctx.get("TG_TRANSCRIBE_LANG") or "auto", "media_path": dest, "text": txt}
+                    "lang": forced or "auto", "detected_lang": res.get("detected_lang"),
+                    "lang_confidence": res.get("lang_confidence"),
+                    "duration": (med or {}).get("duration"),
+                    "flags": flags, "media_path": dest, "text": txt}
             with open(ctx.hist, "a", encoding="utf-8") as f:
                 f.write(json.dumps(meta, ensure_ascii=False) + "\n")
-            transcribed.add(mid)
-            sys.stderr.write("transcribe: msg %s -> %d chars\n" % (mid, len(txt)))
+            transcribed.add((cid, mid))
+            sys.stderr.write("transcribe: %s -> %d chars%s\n" % (
+                ref, len(txt), "  ⚠ " + "; ".join(flags) if flags else ""))
 
 
 # ── poller (singleton long-poll daemon) ───────────────────────────────────────
@@ -678,6 +1010,11 @@ def cmd_poll(ctx, _a):
 
 
 def cmd_doctor(ctx, _a):
+    n = len(legacy_media(ctx))
+    if n:
+        # Loud, because the flat layout is the state in which two chats can share a
+        # media path — and its symptom is reading someone else's file, not an error.
+        print("⚠ %d media file(s) still in the legacy flat layout — run `tg migrate`" % n)
     if poller_alive(ctx):
         print("poller alive (pid %s)" % _read(ctx.pid)); return
     try: os.remove(ctx.pid)
@@ -708,8 +1045,18 @@ def _dur(s):
 
 def _fmt_line(ctx, r, watched, topics_cache):
     if r.get("kind") == "transcript":
+        cid = (r.get("chat") or {}).get("id")
+        if watched is not None and cid is not None and cid not in watched:
+            return None
         t = (r.get("text") or "").replace("\n", " / ")
-        return "MSG [voice transcript #%s]: %s" % (r.get("ref_message_id"), t)
+        ref = ref_str(ctx, cid, r.get("ref_message_id")) if cid is not None \
+            else "#%s" % r.get("ref_message_id")
+        flags = r.get("flags") or []
+        # A flagged transcript says so ON THE LINE that wakes the reader. Anything
+        # quieter (a field only `show` prints) is a warning nobody sees in time —
+        # and acting on a confidently-wrong word is the whole failure mode.
+        warn = "  ⚠ %s" % "; ".join(flags) if flags else ""
+        return "MSG [voice transcript %s]%s: %s" % (ref, warn, t)
     if r.get("direction") != "in":
         return None
     if r.get("kind") == "poll_answer":
@@ -767,7 +1114,11 @@ def _fmt_line(ctx, r, watched, topics_cache):
     bits = [label] + ([str(cid)] if cid is not None else []) + ([topic_tag] if topic_tag else [])
     prefix = "[%s] " % " ".join(bits)
     mid = r.get("message_id")
-    name = "%s #%s" % (name, mid) if mid is not None else name
+    # The ref is printed QUALIFIED (`#GROUP:1746`, not `#1746`) even though the
+    # bracket already names the chat: the id is the token that gets copied out of
+    # this line into `tg reply`, often days later and without the bracket, and a
+    # bare id silently means a different message in another chat.
+    name = "%s #%s" % (name, ref_str(ctx, cid, mid)) if mid is not None else name
     txt = r.get("text")
     if txt:
         return "MSG %s%s: %s" % (prefix, name, txt.replace("\n", " / "))
@@ -926,38 +1277,27 @@ def cmd_send(ctx, a):
     print("ok msg %s" % j["result"].get("message_id"))
 
 
-def _inbound_msg(ctx, mid):
-    """The stored inbound row for a message id (latest match wins — an edit lands
-    as a later row, same id), or None if we never ingested it. The mechanical way
-    reply / react / delete target the ORIGINATING chat (and forum thread) instead
-    of guessing it from an ambiguous type word."""
-    origin = None
-    if os.path.exists(ctx.hist):
-        with open(ctx.hist, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                if r.get("direction") == "in" and not r.get("kind") \
-                        and r.get("message_id") == mid:
-                    origin = r            # keep scanning → most recent match wins
-    return origin
+def _resolve_msg_target(ctx, a, raw, cmd):
+    """(chat_id, message_id) for a message-id-primary command (react / delete).
 
-
-def _resolve_msg_target(ctx, a, mid, cmd):
-    """Chat for a message-id-primary command (react / delete): an explicit --to
-    override wins; otherwise the originating chat, resolved from history. Never the
-    group by default — an unknown message with no --to is a hard error, not a
-    broadcast."""
-    if getattr(a, "to_flag", None):
-        return ctx.resolve_chat(a.to_flag)
-    origin = _inbound_msg(ctx, mid)
-    cid = (origin or {}).get("chat", {}).get("id") if origin else None
+    Three ways to name the chat, in precedence order: an explicit --to (which also
+    reaches a message we never ingested), a qualified ref (GROUP:1746), or history
+    lookup of a bare id — and that last one REFUSES rather than guess when several
+    chats hold the id. Never the group by default; an unknown message with no --to
+    is a hard error, not a broadcast."""
+    chat_spec, mid = parse_ref(raw, cmd)
+    override = getattr(a, "to_flag", None)
+    if override and chat_spec and \
+            str(ctx.resolve_chat(override)) != str(ctx.resolve_chat(chat_spec)):
+        die("%s: --to %s contradicts the ref %s — pass one or the other, not two "
+            "different chats" % (cmd, override, raw), 2)
+    if override or chat_spec:
+        return ctx.resolve_chat(override or chat_spec), mid
+    origin = resolve_ref(ctx, raw, cmd)
+    cid = (origin.get("chat") or {}).get("id")
     if cid is None:
-        die("%s: don't know which chat msg #%s is in — it's not in history. Pass "
-            "--to <chat> to name it explicitly." % (cmd, mid), 2)
-    return str(cid)
+        die("%s: message #%s carries no chat id" % (cmd, mid), 2)
+    return str(cid), mid
 
 
 def cmd_reply(ctx, a):
@@ -967,12 +1307,8 @@ def cmd_reply(ctx, a):
     shown after the sender in `tg watch` / `tg pending` lines. This is the safe
     way to answer the channel a message came from when several look alike."""
     text = _msg_text(a)
-    if not re.fullmatch(r"\d+", str(a.msg_id)):
-        die("reply: msg_id must be numeric (the #<id> from a watch/pending line)", 2)
-    mid = int(a.msg_id)
-    origin = _inbound_msg(ctx, mid)
-    if not origin:
-        die("reply: no inbound message #%s in history (poll first?)" % mid, 2)
+    origin = resolve_ref(ctx, a.msg_id, "reply")
+    mid = origin.get("message_id")
     to = (origin.get("chat") or {}).get("id")
     if to is None:
         die("reply: message #%s carries no chat id" % mid, 2)
@@ -987,8 +1323,8 @@ def cmd_reply(ctx, a):
     if not j.get("ok"):
         die("reply failed: %s" % j.get("description"))
     _log_out(ctx, str(to), j["result"])
-    where = ctx.chat_alias(to) or to
-    print("ok msg %s → reply in [%s %s]" % (j["result"].get("message_id"), where, to))
+    print("ok msg %s → reply to %s in [%s %s]" % (
+        j["result"].get("message_id"), ref_str(ctx, to, mid), ctx.chat_alias(to) or to, to))
 
 
 def cmd_sendvoice(ctx, a):
@@ -1131,13 +1467,15 @@ def cmd_pollstatus(ctx, a):
     poll in history is used."""
     if not os.path.exists(ctx.hist):
         die("no history yet — poll first", 2)
-    want_mid = None
+    want_mid, want_chat = None, None
     if getattr(a, "msg_id", None) is not None:
-        if not re.fullmatch(r"\d+", str(a.msg_id)):
-            die("pollstatus: msg_id must be numeric (the poll's message id)", 2)
-        want_mid = int(a.msg_id)
+        # OUTBOUND ids are per-chat too: two polls sent to different chats can share
+        # a message id, and picking the newest would mark the wrong one reviewed —
+        # silently hiding real votes on the other. Same ref grammar as everywhere.
+        spec, want_mid = parse_ref(a.msg_id, "pollstatus")
+        want_chat = int(ctx.resolve_chat(spec)) if spec else None
     want_pid = getattr(a, "poll_id", None)
-    poll_row, answers = None, {}     # answers: poll_id -> {voter_id: (date, name, option_ids)}
+    poll_row, answers, matches = None, {}, []   # answers: poll_id -> {voter: (date, name, options)}
     with open(ctx.hist, encoding="utf-8") as f:
         for line in f:
             try:
@@ -1150,6 +1488,9 @@ def cmd_pollstatus(ctx, a):
                     continue
                 if want_mid is not None and r.get("message_id") != want_mid:
                     continue
+                if want_chat is not None and (r.get("chat") or {}).get("id") != want_chat:
+                    continue
+                matches.append(r)
                 poll_row = r                         # keep scanning → most recent match wins
             elif r.get("kind") == "poll_answer" and r.get("poll_id"):
                 vid = (r.get("from") or {}).get("id")
@@ -1163,6 +1504,16 @@ def cmd_pollstatus(ctx, a):
     if not poll_row:
         die("pollstatus: no matching poll in history — send one with `tg sendpoll` "
             "(and the poller must have ingested the votes)", 2)
+    if want_mid is not None and want_chat is None:
+        chats = {(r.get("chat") or {}).get("id") for r in matches}
+        if len(chats) > 1:
+            lines = ["pollstatus: #%s names a poll in %d different chats — reviewing "
+                     "one marks it seen, so pick explicitly:" % (want_mid, len(chats))]
+            for r in matches:
+                c = (r.get("chat") or {}).get("id")
+                lines.append("      %-26s %s" % (ref_str(ctx, c, want_mid),
+                                                 (r.get("text") or "").replace("\n", " ")[:48]))
+            die("\n".join(lines), 2)
     poll = poll_row["poll"]
     pid, options = poll.get("poll_id"), poll.get("options") or []
     mid = poll_row.get("message_id")
@@ -1232,12 +1583,10 @@ def cmd_reactions(ctx, a):
 
 
 def cmd_react(ctx, a):
-    if not re.fullmatch(r"\d+", str(a.msg_id)):
-        die("react: msg_id must be numeric (the #<id> from a watch/pending line)", 2)
-    to = _resolve_msg_target(ctx, a, int(a.msg_id), "react")
+    to, mid = _resolve_msg_target(ctx, a, a.msg_id, "react")
     reaction = [] if not a.emoji else [{"type": "emoji", "emoji": a.emoji}]
     j = api_post(ctx, "setMessageReaction",
-                 {"chat_id": to, "message_id": a.msg_id, "reaction": json.dumps(reaction)})
+                 {"chat_id": to, "message_id": str(mid), "reaction": json.dumps(reaction)})
     if not j.get("ok"):
         # Telegram rejects any emoji outside this chat's allowed set (a fixed
         # global list, optionally narrowed by the group's admins) — `tg
@@ -1248,12 +1597,10 @@ def cmd_react(ctx, a):
 
 
 def cmd_delete(ctx, a):
-    if not re.fullmatch(r"\d+", str(a.msg_id)):
-        die("delete: msg_id must be numeric (the #<id> from a watch/pending line)", 2)
-    to = _resolve_msg_target(ctx, a, int(a.msg_id), "delete")
-    j = api_post(ctx, "deleteMessage", {"chat_id": to, "message_id": a.msg_id})
+    to, mid = _resolve_msg_target(ctx, a, a.msg_id, "delete")
+    j = api_post(ctx, "deleteMessage", {"chat_id": to, "message_id": str(mid)})
     row = {"kind": "deleted", "direction": "out", "chat": {"id": int(to)},
-           "ref_message_id": int(a.msg_id), "date": int(time.time()), "api_response": j}
+           "ref_message_id": mid, "date": int(time.time()), "api_response": j}
     with open(ctx.hist, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
     print("ok" if j.get("ok") else "err: %s" % j.get("description"))
@@ -1261,6 +1608,99 @@ def cmd_delete(ctx, a):
 
 def cmd_media(ctx, _a):
     fetch_media(ctx)
+
+
+def legacy_media(ctx):
+    """Flat `media/<msg_id>.<ext>` files left from before the layout was chat-scoped."""
+    out = []
+    try:
+        names = os.listdir(ctx.media)
+    except OSError:
+        return out
+    for name in sorted(names):
+        if os.path.isfile(os.path.join(ctx.media, name)):
+            out.append(name)
+    return out
+
+
+def cmd_migrate(ctx, a):
+    """Move legacy flat media (`media/<msg_id>.<ext>`) into the chat-scoped layout
+    (`media/<chat_id>/<msg_id>.<ext>`). Idempotent; `--dry-run` previews.
+
+    Placement is derived, not guessed: download used to be gated on the bare id, so
+    the bytes on disk belong to the FIRST message that arrived with that id — the
+    later same-numbered ones found the path taken and were skipped. That also makes
+    the losses enumerable, and they are listed at the end: their file_ids are still
+    in history, so `tg media` simply fetches them, now into distinct paths."""
+    rows = load_rows(ctx)
+    owners, audio = {}, {}
+    transcribed = {r.get("ref_message_id") for r in rows if r.get("kind") == "transcript"}
+    for r in rows:
+        if not is_message(r):
+            continue
+        med = r.get("media")
+        if not med or not med.get("file_id"):
+            continue
+        cid = (r.get("chat") or {}).get("id")
+        mid = r.get("message_id")
+        if cid is None or mid is None:
+            continue
+        d = r.get("date") or 0
+        owners.setdefault((mid, media_ext(med)), []).append((d, cid))
+        if med.get("type") in _TRANSCRIBE:
+            audio.setdefault(mid, []).append((d, cid))     # .txt sidecar rides the audio
+    for v in list(owners.values()) + list(audio.values()):
+        v.sort()
+
+    moved, skipped = [], []
+    for name in legacy_media(ctx):
+        src = os.path.join(ctx.media, name)
+        stem, dot, ext = name.rpartition(".")
+        if not dot or not stem.isdigit():
+            skipped.append((name, "not a <msg_id>.<ext> name")); continue
+        mid = int(stem)
+        # A `.txt` is a transcript sidecar ONLY if that message was transcribed —
+        # people also send .txt DOCUMENTS, and the extension alone can't tell them
+        # apart. History can: the old writer wrote a sidecar unconditionally (it
+        # would clobber a same-named document), so a transcript row for this id
+        # means the sidecar owns the bytes; no transcript row means a document does.
+        if ext == "txt" and mid in transcribed:
+            cands = audio.get(mid)
+        else:
+            cands = owners.get((mid, ext))
+        if not cands:
+            skipped.append((name, "no message in history owns it")); continue
+        cid = cands[0][1]
+        dest = media_path(ctx, cid, mid, ext)
+        if os.path.exists(dest):
+            skipped.append((name, "already at %s" % os.path.relpath(dest, ctx.root))); continue
+        if not a.dry_run:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.rename(src, dest)
+        moved.append((name, ref_str(ctx, cid, mid), os.path.relpath(dest, ctx.root)))
+
+    lost = []
+    for (mid, ext), cands in sorted(owners.items()):
+        for _d, cid in cands[1:]:
+            if not os.path.exists(media_path(ctx, cid, mid, ext)):
+                lost.append(ref_str(ctx, cid, mid))
+
+    verb = "would move" if a.dry_run else "moved"
+    print("migrate: %s %d file(s)" % (verb, len(moved)))
+    for name, ref, dest in moved:
+        print("    %-16s %-24s -> %s" % (name, ref, dest))
+    if skipped:
+        print("  %d left in place:" % len(skipped))
+        for name, why in skipped:
+            print("    %-16s %s" % (name, why))
+    if lost:
+        print("\n%d message(s) never received their media — a same-numbered message in "
+              "another chat held the path:" % len(lost))
+        for ref in lost:
+            print("    %s" % ref)
+        print("→ `tg media` re-downloads them from the file_ids in history (distinct paths now)")
+    if a.dry_run:
+        print("\n(dry run — nothing moved; re-run without --dry-run)")
 
 
 def cmd_ids(ctx, _a):
@@ -1284,36 +1724,15 @@ def cmd_ids(ctx, _a):
         print("%15s  %-10s  %s" % (cid, ctype, ", ".join(sorted(names))))
 
 
-def cmd_show(ctx, a):
-    """Print the FULL stored record for one inbound message id: the complete text
-    untruncated, plus sender / chat / thread / date and any media or voice
-    transcript. Every `tg watch` line ends with `#<id>`, but the live view (and
-    the Monitor that surfaces it) can clip a long message — `tg show <id>`
-    recovers the whole thing without hand-grepping var/telegram/history.jsonl."""
-    if not os.path.exists(ctx.hist):
-        print("no history yet — poll first"); return
-    try:
-        mid = int(a.msg_id)
-    except (TypeError, ValueError):
-        die("show: message id must be numeric (got %r)" % a.msg_id, 2)
-    hits, transcripts = [], []
-    with open(ctx.hist, encoding="utf-8") as f:
-        for line in f:
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            if r.get("message_id") == mid and r.get("direction") == "in" and not r.get("kind"):
-                hits.append(r)          # append-only: an edit lands as a later row, same id
-            elif r.get("kind") == "transcript" and r.get("ref_message_id") == mid:
-                transcripts.append(r)
-    if not hits:
-        print("no inbound message #%s in history%s" % (
-            mid, " (voice transcript only — below)" if transcripts else ""))
-        for t in transcripts:
-            print("\n[voice transcript]\n%s" % (t.get("text") or ""))
-        return
-    r = hits[-1]                        # the last row is the current text (edits supersede)
+def _print_transcript(t):
+    flags = t.get("flags") or []
+    head = "[voice transcript]"
+    if flags:
+        head = "⚠ [voice transcript — %s]" % "; ".join(flags)
+    print("\n%s\n%s" % (head, t.get("text") or ""))
+
+
+def _show_message(ctx, r, transcripts):
     chat = r.get("chat") or {}
     cid = chat.get("id")
     label = ctx.chat_alias(cid) or chat.get("title") or (
@@ -1322,17 +1741,19 @@ def cmd_show(ctx, a):
     who = frm.get("first_name") or "?"
     if frm.get("username"):
         who += " (@%s)" % frm["username"]
-    hdr = "#%s  from %s  in [%s%s]" % (mid, who, label, "" if cid is None else " %s" % cid)
+    hdr = "%s  from %s  in [%s%s]" % (ref_str(ctx, cid, r.get("message_id")), who, label,
+                                      "" if cid is None else " %s" % cid)
     if r.get("thread_id") is not None:
         hdr += " thread %s" % r["thread_id"]
     if r.get("iso"):
         hdr += "  %s" % r["iso"]
-    if r.get("edited") or len(hits) > 1:
+    if r.get("edited"):
         hdr += "  (edited)"
     print(hdr)
     med = r.get("media")
     if med:
-        print("media: %s%s" % (med.get("type", "media"), _dur(med.get("duration"))))
+        print("media: %s%s  %s" % (med.get("type", "media"), _dur(med.get("duration")),
+                                   media_path(ctx, cid, r.get("message_id"), media_ext(med))))
     txt = r.get("text")
     if txt:
         print()
@@ -1340,7 +1761,51 @@ def cmd_show(ctx, a):
     elif not med and r.get("raw_keys"):
         print("(no text/media — telegram fields: %s)" % ", ".join(r["raw_keys"]))
     for t in transcripts:
-        print("\n[voice transcript]\n%s" % (t.get("text") or ""))
+        _print_transcript(t)
+
+
+def cmd_show(ctx, a):
+    """Print the FULL stored record for a message: complete text untruncated, plus
+    sender / chat / thread / date and any media or voice transcript. `tg watch`
+    lines clip long messages (and the Monitor surfacing them clips further) — this
+    recovers the whole thing without hand-grepping history.jsonl.
+
+    Takes a qualified ref (`GROUP:1746`) or a bare id. Where a write command
+    refuses an ambiguous bare id, `show` prints EVERY message carrying it, each
+    under its own header with its own transcript attached. Reading is safe to
+    disambiguate by showing more; the failure being fixed was one message's header
+    printed above another's transcript, which looked entirely coherent and was
+    wrong. Two clearly separated records can't do that."""
+    rows = load_rows(ctx)
+    if not rows:
+        print("no history yet — poll first"); return
+    chat_spec, mid = parse_ref(a.msg_id, "show")
+    legacy = first_arrival(rows)
+    tr = {}
+    for r in rows:
+        if r.get("kind") == "transcript":
+            k = transcript_key(r, legacy)
+            if k:
+                tr.setdefault(k, []).append(r)
+    hits = sorted((r for (_c, m), r in inbound_messages(rows).items() if m == mid),
+                  key=lambda r: r.get("date") or 0)
+    if chat_spec is not None:
+        want = int(ctx.resolve_chat(chat_spec))
+        hits = [r for r in hits if (r.get("chat") or {}).get("id") == want]
+    if not hits:
+        orphans = [t for (_c, m), ts in tr.items() if m == mid for t in ts]
+        print("no inbound message #%s in history%s" % (
+            mid, " (voice transcript only — below)" if orphans else ""))
+        for t in orphans:
+            _print_transcript(t)
+        return
+    if len(hits) > 1:
+        print("⚠ %d different messages carry id #%s (message ids are per-chat). "
+              "Showing all; name one with its ref to see it alone.\n" % (len(hits), mid))
+    for i, r in enumerate(hits):
+        if i:
+            print("\n" + "─" * 64 + "\n")
+        _show_message(ctx, r, tr.get(((r.get("chat") or {}).get("id"), mid), []))
 
 
 # How far back we look for polls. A poll has no "closed" state we can see, so
@@ -1443,6 +1908,45 @@ def cmd_polls(ctx, a):
     print("→ `tg pollstatus <#id>` for the per-option tally (who ticked what)")
 
 
+def _reconcile_state(rows):
+    """Per-(chat, thread) watermarks: newest inbound, newest outbound, newest ack.
+
+    Shared by `pending` and `ack` so the two can never disagree about what is still
+    owed — they used to compute it separately, which is exactly how `ack` came to
+    report success on a chat while `pending` kept showing its threads."""
+    last_in, last_out, last_ack, who, msgs = {}, {}, {}, {}, {}
+    for r in rows:
+        d = r.get("date")
+        if d is None:                       # undated rows (failed sends, deletes) carry no ordering
+            continue
+        cid = (r.get("chat") or {}).get("id")
+        if cid is None:
+            continue
+        key = (cid, r.get("thread_id"))
+        if is_message(r):                   # real inbound message only
+            if d >= last_in.get(key, -1):
+                last_in[key] = d
+                who[key] = (r.get("from") or {}).get("first_name") or "?"
+            msgs.setdefault(key, []).append((d, _preview(r, 100), r.get("message_id")))
+        elif r.get("direction") == "out":
+            last_out[key] = max(d, last_out.get(key, -1))
+        elif r.get("kind") == "ack":         # seen, no reply needed — clears like a reply
+            last_ack[key] = max(d, last_ack.get(key, -1))
+    return {"last_in": last_in, "last_out": last_out, "last_ack": last_ack,
+            "who": who, "msgs": msgs}
+
+
+def _seen(st, key):
+    """Watermark for a (chat, thread): replied-to OR acked, whichever is later."""
+    return max(st["last_out"].get(key, -1), st["last_ack"].get(key, -1))
+
+
+def _open_keys(st, cid=None):
+    """(chat, thread) pairs still holding unanswered inbound, optionally one chat."""
+    return sorted(k for k, din in st["last_in"].items()
+                  if din > _seen(st, k) and (cid is None or k[0] == cid))
+
+
 def cmd_pending(ctx, _a):
     """Everything still owed your attention — the reconcile backstop a session runs
     after (re-)arming `tg watch`, to catch what landed while the live Monitor was
@@ -1469,33 +1973,11 @@ def cmd_pending(ctx, _a):
     nothing to reconcile."""
     if not os.path.exists(ctx.hist):
         print("no history yet — poll first"); return
-    last_in, last_out, last_ack, who, msgs = {}, {}, {}, {}, {}
-    with open(ctx.hist, encoding="utf-8") as f:
-        for line in f:
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            d = r.get("date")
-            if d is None:                       # undated rows (failed sends, deletes) carry no ordering
-                continue
-            cid = (r.get("chat") or {}).get("id")
-            if cid is None:
-                continue
-            key = (cid, r.get("thread_id"))
-            if r.get("direction") == "in" and not r.get("kind"):   # real inbound message only
-                if d >= last_in.get(key, -1):
-                    last_in[key] = d
-                    who[key] = (r.get("from") or {}).get("first_name") or "?"
-                msgs.setdefault(key, []).append((d, r.get("text") or "[%s]" % (r.get("media") or "non-text"),
-                                                 r.get("message_id")))
-            elif r.get("direction") == "out":
-                last_out[key] = max(d, last_out.get(key, -1))
-            elif r.get("kind") == "ack":         # seen, no reply needed — clears like a reply
-                last_ack[key] = max(d, last_ack.get(key, -1))
+    st = _reconcile_state(load_rows(ctx))
+    last_in, who, msgs = st["last_in"], st["who"], st["msgs"]
 
-    def seen(key):                               # watermark: replied-to OR acked, whichever is later
-        return max(last_out.get(key, -1), last_ack.get(key, -1))
+    def seen(key):
+        return _seen(st, key)
     rows = [(din, key) for key, din in last_in.items() if din > seen(key)]
     # Only polls with votes we haven't reviewed: those are the ones a dropped Monitor
     # could have swallowed. No votes ⇒ nothing was missed ⇒ not pending (see `tg polls`).
@@ -1514,9 +1996,10 @@ def cmd_pending(ctx, _a):
         loc = (alias + " " if alias else "") + str(cid) + ("" if tid is None else " thread %s" % tid)
         print("%-30s %-12s %d unanswered, last %s" % (loc, who.get(key, "?"), len(unanswered), iso))
         for mid, t in unanswered[-3:]:
-            print("    #%-9s %s" % (mid, t.replace("\n", " ")[:110]))
+            print("    %-24s %s" % (ref_str(ctx, cid, mid), t.replace("\n", " ")[:100]))
     if rows:
-        print("→ `tg reply <#id> <text>` to answer in place, or `tg ack <chat>` for anything that needs no answer")
+        print("→ `tg reply <ref> <text>` to answer in place, or `tg ack <chat>%s` for "
+              "anything that needs no answer" % (" --topic-id <n>" if any(t is not None for _d, (_c, t) in rows) else ""))
 
     if not open_polls:
         return
@@ -1536,33 +2019,49 @@ def cmd_ack(ctx, a):
     at ack time; anything that arrives later re-surfaces. Lets you clear chatter /
     FYIs / thanks you legitimately won't answer without sending a reply. Silent —
     writes only a local history row; to acknowledge VISIBLY to the sender, react
-    instead (`tg react`)."""
+    instead (`tg react`).
+
+    A forum thread is its own reconcile scope, so `tg ack <chat>` clears the chat's
+    main timeline and NOT its topics — correct, but previously indistinguishable
+    from a broken tool: ack printed success while `pending` kept showing the thread,
+    and the natural reading is "ack doesn't work". So an ack that leaves anything
+    open in the same chat now says so, and names the command that finishes the job.
+    `--all-threads` does the whole chat in one go."""
     to = ctx.resolve_chat(_to(a))
+    cid = int(to)
+    if a.all_threads and (a.topic or a.topic_id):
+        die("ack: --all-threads already covers every thread — drop the --topic/--topic-id", 2)
     thread = _thread_for(ctx, a.topic, a.topic_id)
     tid = int(thread) if thread else None
-    latest = None
-    if os.path.exists(ctx.hist):
-        with open(ctx.hist, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                if r.get("direction") != "in" or r.get("kind"):
-                    continue
-                if (r.get("chat") or {}).get("id") != int(to) or r.get("thread_id") != tid:
-                    continue
-                d = r.get("date")
-                if d is not None and (latest is None or d > latest):
-                    latest = d
-    loc = "%s%s" % (to, "" if tid is None else " thread %s" % tid)
-    if latest is None:
-        print("ack: nothing inbound to ack in %s" % loc); return
-    row = {"kind": "ack", "direction": "meta", "chat": {"id": int(to)}, "thread_id": tid,
-           "date": latest, "iso": datetime.datetime.fromtimestamp(latest, datetime.UTC).isoformat()}
-    with open(ctx.hist, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print("ack: %s — seen through %s" % (loc, row["iso"]))
+    st = _reconcile_state(load_rows(ctx))
+    targets = [k for k in _open_keys(st, cid)] if a.all_threads else [(cid, tid)]
+    if a.all_threads and not targets:
+        print("ack: nothing open in %s" % (ctx.chat_alias(cid) or cid)); return
+    acked = []
+    label = "%s %s" % (ctx.chat_alias(cid), to) if ctx.chat_alias(cid) else str(to)
+    for key in targets:
+        latest = st["last_in"].get(key)
+        loc = "%s%s" % (label, "" if key[1] is None else " thread %s" % key[1])
+        if latest is None:
+            print("ack: nothing inbound to ack in %s" % loc)
+            continue
+        row = {"kind": "ack", "direction": "meta", "chat": {"id": cid}, "thread_id": key[1],
+               "date": latest, "iso": datetime.datetime.fromtimestamp(latest, datetime.UTC).isoformat()}
+        with open(ctx.hist, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        st["last_ack"][key] = max(latest, st["last_ack"].get(key, -1))
+        acked.append(key)
+        print("ack: %s — seen through %s" % (loc, row["iso"]))
+    if not acked:
+        return
+    still = [k for k in _open_keys(st, cid) if k not in acked]
+    if still:
+        print("  ⚠ still unanswered in this chat (ack is per-thread):")
+        for _c, t in still:
+            print("      %s%s" % (label,
+                                  " thread %s — `tg ack %s --topic-id %s`" % (t, to, t)
+                                  if t is not None else " (main timeline) — `tg ack %s`" % to))
+        print("      or clear them all: `tg ack %s --all-threads`" % to)
 
 
 def cmd_topics(ctx, a):
@@ -1607,7 +2106,13 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("poll"); sub.add_parser("doctor"); sub.add_parser("watch")
     sub.add_parser("media"); sub.add_parser("ids"); sub.add_parser("pending")
-    s = sub.add_parser("show"); s.add_argument("msg_id", help="inbound message id (the `#<id>` shown in tg watch/pending)")
+    s = sub.add_parser("migrate")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="print what would move, change nothing")
+    s = sub.add_parser("show")
+    s.add_argument("msg_id", metavar="REF",
+                   help="message ref: GROUP:1746 (qualified) or 1746 (bare; shows every "
+                        "chat's message with that id)")
 
     # The target chat is a REQUIRED LEADING positional on every send command: the
     # recipient comes first (like every messaging tool), and the free-form message
@@ -1625,7 +2130,11 @@ def build_parser():
     s.add_argument("--html", action="store_true"); s.add_argument("--dry-run", dest="dry_run", action="store_true")
 
     # reply targets the chat of the message it answers — no [to], by design.
-    s = sub.add_parser("reply"); s.add_argument("msg_id"); s.add_argument("text", nargs="?")
+    s = sub.add_parser("reply")
+    s.add_argument("msg_id", metavar="REF",
+                   help="message ref from watch/pending: GROUP:1746, or a bare 1746 when "
+                        "only one chat has it (ambiguous ⇒ refused, never guessed)")
+    s.add_argument("text", nargs="?")
     s.add_argument("--file", dest="text_file", help="read the reply text from FILE (avoids shell-quoting traps)")
     s.add_argument("--html", action="store_true")
 
@@ -1650,7 +2159,8 @@ def build_parser():
     s.add_argument("--dry-run", dest="dry_run", action="store_true")
 
     s = sub.add_parser("pollstatus")
-    s.add_argument("msg_id", nargs="?", help="the poll's message id (omit for the most recent poll)")
+    s.add_argument("msg_id", nargs="?", metavar="REF",
+                   help="the poll's message ref (GROUP:4567 or a bare 4567; omit for the most recent)")
     s.add_argument("--poll-id", dest="poll_id", help="target by Telegram poll_id instead of message id")
 
     s = sub.add_parser("polls")
@@ -1659,16 +2169,19 @@ def build_parser():
 
     # react / delete are message-id-primary: the chat is resolved from history by
     # msg_id (like reply), so no positional target — --to only overrides it.
-    s = sub.add_parser("react"); s.add_argument("msg_id"); s.add_argument("emoji", nargs="?")
+    s = sub.add_parser("react"); s.add_argument("msg_id", metavar="REF")
+    s.add_argument("emoji", nargs="?")
     s.add_argument("--to", dest="to_flag", metavar="CHAT",
                    help="override target chat (default: the message's chat, from history)")
     s = sub.add_parser("reactions"); add_target(s)
-    s = sub.add_parser("delete"); s.add_argument("msg_id")
+    s = sub.add_parser("delete"); s.add_argument("msg_id", metavar="REF")
     s.add_argument("--to", dest="to_flag", metavar="CHAT",
                    help="override target chat (default: the message's chat, from history)")
 
     s = sub.add_parser("ack"); add_target(s)
     s.add_argument("--topic"); s.add_argument("--topic-id", dest="topic_id")
+    s.add_argument("--all-threads", dest="all_threads", action="store_true",
+                   help="ack every open thread in the chat, not just one scope")
 
     s = sub.add_parser("topics"); s.add_argument("sub", nargs="?"); s.add_argument("args", nargs="*")
     return p
