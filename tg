@@ -31,6 +31,17 @@ can plausibly be with TG_TRANSCRIBE_EXPECT=fr,pt,en.
 
 history.jsonl is an append-only in+out conversation log with a stable schema (safe to tail).
 
+THE OUTBOUND GATE (optional, off unless TG_GATE is set). A repo can name an
+executable — `TG_GATE=tools/my-gate` in tg.conf — and then NOTHING outbound
+reaches Telegram until it exits 0. It is checked inside the HTTP layer, so every
+send/reply/senddoc/sendphoto/sendvoice/sendpoll goes through it and no shell
+syntax (`bash -c`, `$VAR` indirection, heredocs) can route around it — which is
+precisely what a gate mounted as an agent PreToolUse hook cannot promise, since
+that one parses the shell command. The gate reads one JSON object on stdin
+(method, chat id + alias, text, files, verbatim fields, argv) and answers with
+its exit code; its output becomes the refusal message. It FAILS CLOSED: missing,
+non-executable, crashing or slow all refuse. See gate_check() for the contract.
+
 Commands:
   poll                       long-poll daemon (pid-guarded singleton, idempotent)
   doctor                     (re)start the poller detached if dead
@@ -124,8 +135,17 @@ class Ctx:
         cfg = {}
         _load_kv(os.path.join(self.root, "tg.conf"), cfg)       # non-secret config
         _load_kv(os.path.join(self.root, ".env"), cfg)          # local secrets
+        repo_cfg = dict(cfg)                                    # what the REPO said
         cfg.update(os.environ)                                  # env wins
         self.cfg = cfg
+
+        # The outbound gate (see gate_check). Env may ARM a gate, never DISARM the
+        # one the repo declared: `TG_GATE= tg send …` would otherwise be a bypass
+        # in the same family as the shell tricks this gate exists to close. A
+        # relative path is resolved against the repo root, so tg.conf can say
+        # `TG_GATE=tools/my-gate` and mean it from any cwd.
+        g = (repo_cfg.get("TG_GATE") or cfg.get("TG_GATE") or "").strip()
+        self.gate = (g if os.path.isabs(g) else os.path.join(self.root, g)) if g else None
 
         self.token = cfg.get("TG_BOT_TOKEN") or _read(os.path.join(self.var, "token"))
         if not self.token:
@@ -191,6 +211,111 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+# ── the outbound gate ─────────────────────────────────────────────────────────
+
+GATE_REFUSED, GATE_BROKEN = 6, 7
+_GATE_ALSO = {"copyMessage", "forwardMessage", "editMessageText", "editMessageCaption"}
+
+
+def gate_applies(method):
+    """Does this API method put CONTENT in someone's chat?
+
+    A PREFIX rule plus a short list, deliberately not an enumeration of the
+    commands tg has today: a `sendX` added next year is gated by default, and the
+    only way to add an ungated send is to name it something that isn't a send.
+    The failure this whole mechanism exists to close is a door nobody remembered
+    to lock. sendChatAction (the typing indicator) carries no content and is out."""
+    return (method.startswith("send") and method != "sendChatAction") or method in _GATE_ALSO
+
+
+def gate_check(ctx, method, fields, files=None):
+    """Run the repo's TG_GATE executable, and send only if it exits 0.
+
+    WHY THIS LIVES IN tg AND NOT IN A HOOK. A gate mounted as an agent-harness
+    PreToolUse hook inspects the SHELL COMMAND, so it is only as good as its
+    ability to parse shell: `bash -c "tg send …"`, `T=tg; $T send …` and a heredoc
+    feeding a compound command all walk straight past it — and they do so
+    SILENTLY, which is the worst property a guard can have. (Measured in the wild:
+    a message delivered with no entry in the gate's own journal, i.e. an ungated
+    send that by construction left nothing behind to count.) Here there is one
+    door: every send funnels through api_post/api_post_multipart, so no shell
+    syntax can route around it, because no shell is involved any more.
+
+    The hook can stay as a fast pre-filter — it sees the intent earlier and can
+    give a nicer message — but it stops being the guarantee.
+
+    CONTRACT. The gate gets one JSON object on stdin (schema 1) describing exactly
+    what is about to reach Telegram — method, resolved chat id + alias, text or
+    caption, thread, files, the verbatim API fields, and the argv that asked for
+    it. Exit 0 lets it through; any non-zero exit refuses, and whatever the gate
+    printed becomes the refusal message. Its stderr is always forwarded, so a gate
+    can warn without refusing. It runs with cwd = repo root and no shell.
+
+    FAIL CLOSED, ALWAYS. A TG_GATE that is missing, not executable, crashes, or
+    times out REFUSES the send. A guard that can't run is not a guard that passes:
+    that equivalence is exactly how the hook version died unnoticed for five days.
+    The one intentionally silent case is no TG_GATE at all — a repo that never
+    asked for a gate is not a repo whose gate is broken.
+
+    RECURSION. The gate runs with TG_GATE_DEPTH=1; a send attempted from inside a
+    gate decision is refused, not exempted. So the env var is useless as a bypass
+    (setting it can only block you), and a gate that wants to talk to Telegram
+    about its own refusal has to do it out-of-band. Reading is fine: show,
+    pending, ids and friends are not gated.
+
+    FREE SIDE EFFECT, and the reason the journal matters more than the veto: if
+    the gate journals every decision, "a send with no journal entry" stops being
+    undetectable and becomes impossible."""
+    if not gate_applies(method) or not ctx.gate:
+        return
+    if os.environ.get("TG_GATE_DEPTH"):
+        die("gate recursion: %s attempted while the gate was deciding on a send. A gate must "
+            "not send through tg — it may READ (show/pending/ids). Nothing was sent." % method,
+            GATE_BROKEN)
+    if not os.path.isfile(ctx.gate) or not os.access(ctx.gate, os.X_OK):
+        die("TG_GATE=%s is not an executable file — refusing to send. Fix the path (or unset "
+            "TG_GATE if this repo really has no gate); a guard that cannot run must not read "
+            "as a guard that passed." % ctx.gate, GATE_BROKEN)
+    cid = str(fields.get("chat_id") or "")
+    payload = {
+        "schema": 1,
+        "iso": datetime.datetime.now(datetime.UTC).isoformat(),
+        "method": method,
+        "command": sys.argv[1] if len(sys.argv) > 1 else None,
+        "argv": sys.argv[1:],
+        "chat": {"id": cid, "alias": ctx.chat_alias(cid)},
+        # The message as a human would read it, hoisted out of `fields` so the
+        # common gate (how long is this, who is it for, how many today) needs no
+        # per-method knowledge. `fields` stays verbatim underneath for the rest.
+        "text": fields.get("text") or fields.get("caption") or fields.get("question"),
+        "thread_id": fields.get("message_thread_id"),
+        "reply_to_message_id": fields.get("reply_to_message_id"),
+        "files": [{"field": k, "name": v[0], "bytes": len(v[1])}
+                  for k, v in (files or {}).items()],
+        "fields": {k: v for k, v in fields.items() if k != "chat_id"},
+        "root": ctx.root,
+    }
+    try:
+        timeout = float(ctx.get("TG_GATE_TIMEOUT", 30))
+    except ValueError:
+        timeout = 30.0
+    try:
+        r = subprocess.run([ctx.gate], input=json.dumps(payload, ensure_ascii=False),
+                           text=True, capture_output=True, cwd=ctx.root, timeout=timeout,
+                           env=dict(os.environ, TG_GATE_DEPTH="1"))
+    except subprocess.TimeoutExpired:
+        die("gate %s did not answer in %gs — nothing sent (fail closed)." % (ctx.gate, timeout),
+            GATE_BROKEN)
+    except OSError as e:
+        die("cannot run gate %s: %s — nothing sent (fail closed)." % (ctx.gate, e), GATE_BROKEN)
+    if r.stderr.strip():
+        sys.stderr.write(r.stderr if r.stderr.endswith("\n") else r.stderr + "\n")
+    if r.returncode != 0:
+        die("refused by the gate (%s, exit %d): %s" % (
+            os.path.relpath(ctx.gate, ctx.root), r.returncode,
+            r.stdout.strip() or "the gate gave no reason"), GATE_REFUSED)
+
+
 # ── HTTP (Telegram Bot API) ─────────────────────────────────────────────────
 
 def _http(url, data=None, headers=None, timeout=60, method=None, opener=None):
@@ -231,6 +356,7 @@ def api_get(ctx, method, params=None, timeout=60):
 
 
 def api_post(ctx, method, fields, timeout=60):
+    gate_check(ctx, method, fields)
     body = urllib.parse.urlencode(fields).encode()
     return json.loads(_http("%s/%s" % (ctx.api, method), data=body,
                             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -256,6 +382,7 @@ def _multipart(fields, files):
 
 
 def api_post_multipart(ctx, method, fields, files, timeout=120):
+    gate_check(ctx, method, fields, files)
     boundary, body = _multipart(fields, files)
     return json.loads(_http(
         "%s/%s" % (ctx.api, method), data=body,
@@ -1047,6 +1174,14 @@ def cmd_poll(ctx, _a):
 
 
 def cmd_doctor(ctx, _a):
+    # State the gate out loud. The hook-era failure was invisible for five days
+    # because nothing ever printed whether the guard was actually in the path.
+    if ctx.gate:
+        ok = os.path.isfile(ctx.gate) and os.access(ctx.gate, os.X_OK)
+        print("gate %s %s" % (os.path.relpath(ctx.gate, ctx.root),
+                              "armed" if ok else "⚠ NOT EXECUTABLE — every send refused"))
+    else:
+        print("gate none (TG_GATE unset — sends go straight out)")
     n = len(legacy_media(ctx))
     if n:
         # Loud, because the flat layout is the state in which two chats can share a

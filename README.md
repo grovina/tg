@@ -62,6 +62,8 @@ TG_TRANSCRIBE_LANG_ALICE=fr            # per-chat override — beats auto-detect
 TG_TRANSCRIBE_EXPECT=fr,pt,en          # what this repo can plausibly be; flags anything else
 TG_WATCHED_CHATS=-1001234567890        # restrict `watch` to these chats
 TG_ELEVENLABS_VOICE_ID=...             # only for sendvoice (TTS)
+TG_GATE=tools/my-gate                  # veto every outbound message (see below)
+TG_GATE_TIMEOUT=30                     # seconds the gate gets to answer
 ```
 
 **Secrets** stay out of `tg.conf` (which is non-secret config — chat ids, voice
@@ -73,6 +75,53 @@ How those env vars get set is the caller's business — a shell `export`, a
 `.env`, or whatever your orchestrator injects. `tg` only reads them.
 
 Config is read from `tg.conf` then `.env`, with environment variables winning.
+The one exception is `TG_GATE`: the environment can *arm* a gate but never
+*disarm* the one `tg.conf` declares, because `TG_GATE= tg send …` would be a
+bypass of exactly the kind the gate exists to close.
+
+## The outbound gate (optional)
+
+Set `TG_GATE` to an executable and **nothing outbound reaches Telegram until it
+exits 0** — `send`, `reply`, `senddoc`, `sendphoto`, `sendvoice`, `sendpoll`, and
+any `send*` added later. The check sits in the HTTP layer, not in the command
+parsers, so there is one door and no shell syntax leads around it.
+
+That last property is the whole point. The usual place to mount such a guard is
+an agent harness's pre-tool hook, which inspects the *shell command* — and so is
+defeated, silently, by `bash -c "tg send …"`, by `T=tg; $T send …`, and by a
+heredoc feeding a compound command. Silently is the part that hurts: an ungated
+send leaves nothing behind, so you cannot even count what you lost. A hook is
+still a fine *pre-filter* (it sees intent earlier and can explain itself better);
+it just cannot be the guarantee. This can.
+
+**Contract.** The gate is run with no shell, cwd at the repo root, and receives
+one JSON object on stdin:
+
+```json
+{"schema": 1, "iso": "2026-08-22T…", "method": "sendMessage", "command": "send",
+ "argv": ["send", "GROUP", "…"], "chat": {"id": "-1001234567890", "alias": "GROUP"},
+ "text": "the message as a human reads it", "thread_id": null,
+ "reply_to_message_id": null, "files": [], "fields": {…verbatim API fields…},
+ "root": "/path/to/repo"}
+```
+
+Exit `0` sends. Any non-zero exit refuses, and whatever the gate printed on
+stdout becomes the refusal message (`tg` then exits **6**). The gate's stderr is
+always forwarded, so it can warn without refusing.
+
+**It fails closed.** A `TG_GATE` that is missing, not executable, crashes, or
+exceeds `TG_GATE_TIMEOUT` refuses the send (exit **7**). A guard that cannot run
+must never read as a guard that passed — that equivalence is how gates die
+unnoticed. `tg doctor` prints whether the gate is armed, for the same reason.
+
+**No recursion, no bypass.** The gate runs with `TG_GATE_DEPTH=1`; a send
+attempted from inside a gate decision is refused rather than exempted, so the
+variable is useless as an escape hatch — setting it can only block you. Reading
+(`show`, `pending`, `ids`) is never gated.
+
+**Side effect worth more than the veto:** if your gate journals its decisions, it
+becomes the authoritative send log — *"a message with no journal entry"* goes
+from undetectable to impossible.
 
 ## Commands
 
