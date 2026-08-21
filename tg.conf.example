@@ -15,3 +15,9 @@ ALICE=10000001
 TG_TRANSCRIBE_LANG=pt              # omit for auto-detect (multilingual groups)
 TG_WATCHED_CHATS=-1001234567890    # comma-separated; restrict `watch` to these chats
 TG_ELEVENLABS_VOICE_ID=            # only for sendvoice (TTS)
+
+# Outbound gate (optional): an executable that vets EVERY outbound message before
+# it reaches Telegram — exit 0 sends, non-zero refuses, and a gate that can't run
+# refuses too. Path is relative to the repo root. See README § The outbound gate.
+# TG_GATE=tools/my-gate
+# TG_GATE_TIMEOUT=30
