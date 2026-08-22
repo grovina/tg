@@ -87,7 +87,7 @@ chat_id). Never infer a target from a type word.
 """
 import sys, os, json, re, time, uuid, signal, datetime, mimetypes, subprocess, filecmp
 import socket, threading, http.client
-import urllib.request, urllib.parse
+import urllib.request, urllib.parse, urllib.error
 
 
 # ── repo resolution + config ──────────────────────────────────────────────────
@@ -323,8 +323,30 @@ def _http(url, data=None, headers=None, timeout=60, method=None, opener=None):
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     _open = opener.open if opener else urllib.request.urlopen
-    with _open(req, timeout=timeout) as r:
-        return r.read()
+    try:
+        with _open(req, timeout=timeout) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        # Telegram reports its OWN errors as 4xx carrying the SAME JSON envelope
+        # it uses on success: {"ok": false, "description": "Bad Request: chat not
+        # found"}. urllib turns that into a raised HTTPError, so the body — the
+        # only part anyone wants — never reaches the caller, and every
+        # `if not j.get("ok"): die(...)` below is unreachable for precisely the
+        # errors it was written for: sending to an unknown chat printed a urllib
+        # traceback instead of one line. So hand the envelope back and let those
+        # lines do their job. Not a regression risk for the poll loop, which
+        # reads a non-ok body as "no updates" and backs off exactly as before.
+        body = b""
+        try:
+            body = e.read()
+        except Exception:
+            pass
+        try:
+            if isinstance(json.loads(body), dict):
+                return body
+        except Exception:
+            pass
+        raise      # not Telegram speaking (a proxy's HTML 502) — main() words it
 
 
 class _KeepAliveHTTPSConnection(http.client.HTTPSConnection):
@@ -2381,7 +2403,15 @@ def build_parser():
 def main():
     a = build_parser().parse_args()
     ctx = Ctx()
-    globals()["cmd_%s" % a.cmd](ctx, a)
+    try:
+        globals()["cmd_%s" % a.cmd](ctx, a)
+    except urllib.error.HTTPError as e:
+        # Backstop for the transport errors Telegram does NOT describe (a proxy's
+        # HTML 502, a gateway timeout). tg should speak tg at its caller in every
+        # case, not Python — a traceback is a bug report, not an error message.
+        die("HTTP %s from the Telegram API (%s)" % (e.code, e.reason))
+    except urllib.error.URLError as e:
+        die("cannot reach the Telegram API: %s" % e.reason)
 
 
 if __name__ == "__main__":
