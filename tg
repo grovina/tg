@@ -1406,6 +1406,12 @@ def _fmt_line(ctx, r, watched, topics_cache):
 
 
 def cmd_watch(ctx, _a):
+    # Line-buffer the stream. On a pipe (a Monitor, or a bridge into an event
+    # bus) stdout is block-buffered and only the message lines below flush, so
+    # the doctor lines printed at start ("gate …", "poller alive (pid N)") sat in
+    # the buffer until the first message — then surfaced stamped with ITS time: a
+    # liveness report that looked current and wasn't.
+    sys.stdout.reconfigure(line_buffering=True)
     open(ctx.hist, "a").close()
     cmd_doctor(ctx, None)
     fetch_media(ctx)
