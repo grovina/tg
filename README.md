@@ -142,7 +142,7 @@ tg delete <ref>                  deleteMessage + synthetic 'deleted' history row
 tg media                         idempotent backfill: download media + Scribe-transcribe
 tg migrate [--dry-run]           move legacy media/<id>.<ext> → media/<chat_id>/<id>.<ext>
 tg ids                           print chat ids seen in history
-tg show <ref>                    full untruncated text of one inbound message (+ media / voice transcript)
+tg show <ref>                    full untruncated text of one inbound message (+ media / voice transcript / what it replies to)
 tg pending                       chats/threads with inbound newer than your last reply or ack
 tg ack <to> [--topic-id N]       mark a chat/thread SEEN (no reply needed) so it drops from `pending`
                                  [--all-threads] clears every open thread in the chat
@@ -237,6 +237,27 @@ log for the rest of a message. An edited message shows its current text, flagged
 `(edited)`. Given a bare id that several chats share, it prints them all, clearly
 separated, each with its own transcript attached — a transcript is never rendered
 under another message's header.
+
+**Replies — what a message answers.** When an inbound message is a reply, its row
+carries `reply_to`: the replied-to message's `chat` and `message_id`, its sender,
+its full `text`/caption and `media`, and `quote` — the passage the sender quoted,
+if they marked one. It is a snapshot, not just an id, because the original is
+often not in history (sent before the poller ran, or never delivered to a bot in
+privacy mode). `watch` puts it on the line, since a short reply means nothing
+without it — the quote if there is one, else the opening words, clipped at 60
+characters and marked `…`:
+
+```
+MSG [ALICE 10000001] Alice #ALICE:4551 (↩ ALICE:4540 Bot: "Invoice sent, payroll follows tomorrow."): where is the pdf?
+```
+
+`show` prints the original in full. A reply to a message in another chat
+(Telegram's `external_reply`) is marked `"external": true`; Telegram sends its
+media and the quote but not its text, and its chat and id only for supergroups
+and channels. A message that is not a reply stores `"reply_to": null` — a row
+without the key predates the field. In a forum topic, Telegram delivers an
+ordinary message as a reply to the topic's creation message; that one is not
+recorded.
 
 **Reconciling — `pending` and `ack`.** `pending` lists every (chat, thread) whose
 newest inbound is newer than your newest reply **or** ack there. A thread is its

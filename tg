@@ -48,7 +48,8 @@ Commands:
   watch                      doctor + watchdog + follow history.jsonl -> Monitor stream
   send <to> <text|--file F>  sendMessage   (+ --topic <name>|--topic-id <n> --html --dry-run)
   reply <ref> <text|--file F>  reply IN the originating chat (resolved from history) + thread it (+ --html)
-  show <ref>                 the full stored record of a message (text, media, transcript)
+  show <ref>                 the full stored record of a message (text, media, transcript,
+                             and the message it replies to)
   sendvoice <to> <text>      ElevenLabs TTS -> opus -> sendVoice
   senddoc <to> <path>        sendDocument — file attachment (+ --caption --topic …)
   sendphoto <to> <path>      sendPhoto — inline image    (+ --caption --html --topic …)
@@ -467,8 +468,13 @@ def extract_media(m):
     return None
 
 
+# Fields left out of `raw_keys` — the listing that names what a message with no
+# text and no media actually carries. This is NOT the list of what ingest keeps:
+# the row is built field by field in ingest(), so taking a field out of this set
+# does not start storing it.
 _SKIP = {"message_id", "from", "sender_chat", "chat", "date", "text", "caption",
          "caption_entities", "entities", "edit_date", "reply_to_message",
+         "quote", "external_reply",
          "forward_origin", "forward_from", "forward_from_chat",
          "forward_from_message_id", "forward_signature", "forward_sender_name",
          "forward_date", "media_group_id", "author_signature", "via_bot",
@@ -554,6 +560,41 @@ def _event_row(u):
     return None
 
 
+def _reply_ref(m):
+    """What an inbound message replies TO, or None. The replied-to message's
+    identity plus a snapshot of it — sender, full text/caption, media — and the
+    passage the sender quoted, if they marked one. A snapshot, not just the id,
+    because the original is often absent from history: sent before the poller
+    ran, or never delivered to a bot in privacy mode.
+
+    A reply to a forum topic's creation message is not recorded. Telegram
+    delivers a topic message that replies to nothing with reply_to_message set to
+    that service message (widely observed, not in the Bot API docs); keeping it
+    would stamp every topic message as a reply its sender never made.
+
+    external_reply is a reply to a message in another chat or topic. Telegram
+    sends its media but not its text (only the quote), and its chat/message_id
+    only when that chat is a supergroup or channel."""
+    quote = (m.get("quote") or {}).get("text")
+    rm = m.get("reply_to_message")
+    if rm and not rm.get("forum_topic_created"):
+        return {"chat": _chat(rm.get("chat") or m.get("chat")),
+                "message_id": rm.get("message_id"), "external": False,
+                "from": _who(rm.get("from") or rm.get("sender_chat")), "date": rm.get("date"),
+                "text": rm.get("text") or rm.get("caption"), "media": extract_media(rm),
+                "quote": quote}
+    er = m.get("external_reply")
+    if er:
+        o = er.get("origin") or {}
+        who = o.get("sender_user") or o.get("sender_chat") or o.get("chat") or (
+            {"first_name": o["sender_user_name"]} if o.get("sender_user_name") else None)
+        return {"chat": _chat(er["chat"]) if er.get("chat") else None,
+                "message_id": er.get("message_id"), "external": True,
+                "from": _who(who) if who else None, "date": o.get("date"),
+                "text": None, "media": extract_media(er), "quote": quote}
+    return None
+
+
 def ingest(ctx, body):
     """Parse a getUpdates response; append rows; persist offset. Returns True on ok."""
     try:
@@ -591,6 +632,7 @@ def ingest(ctx, body):
             "from": {"id": fr.get("id"), "first_name": fr.get("first_name"),
                      "username": fr.get("username")},
             "thread_id": m.get("message_thread_id"), "text": text, "media": media,
+            "reply_to": _reply_ref(m),
             "raw_keys": raw_keys, "edited": bool(u.get("edited_message")),
         })
     if rows:
@@ -1237,6 +1279,39 @@ def _dur(s):
     return " %d:%02d" % (s // 60, s % 60)
 
 
+def _clip(s, width):
+    s = " ".join((s or "").split())
+    return s if len(s) <= width else s[:width - 1] + "…"
+
+
+def _reply_loc(ctx, rt):
+    """The replied-to message as a ref. A cross-chat reply says so: its id means
+    an unrelated message in the chat being read."""
+    rc, rm = (rt.get("chat") or {}).get("id"), rt.get("message_id")
+    loc = ref_str(ctx, rc, rm) if rc is not None and rm is not None else None
+    if rt.get("external"):
+        return "%s (other chat)" % loc if loc else "a message in another chat"
+    return loc or "?"
+
+
+def _reply_tag(ctx, rt, width=60):
+    """`(↩ DM:4540 Bot: "The invoice is…")` — what a message answers, on the line
+    that wakes the reader. A short reply leans on it entirely: "done, sent it"
+    names nothing until you can see which message it sits under. A quote, when
+    the sender marked one, is what they pointed at, so it wins over the opening
+    words. The clip is marked, so a preview never reads as the whole message."""
+    who = (rt.get("from") or {}).get("first_name") or "?"
+    if rt.get("quote"):
+        body = 'quoting "%s"' % _clip(rt["quote"], width)
+    else:
+        med = rt.get("media")
+        bits = ["%s %s" % (_ICON.get(med.get("type"), "📦"), med.get("type"))] if med else []
+        if rt.get("text"):
+            bits.append('"%s"' % _clip(rt["text"], width))
+        body = " ".join(bits) or "(no text)"
+    return "(↩ %s %s: %s)" % (_reply_loc(ctx, rt), who, body)
+
+
 def _fmt_line(ctx, r, watched, topics_cache):
     if r.get("kind") == "transcript":
         cid = (r.get("chat") or {}).get("id")
@@ -1313,6 +1388,8 @@ def _fmt_line(ctx, r, watched, topics_cache):
     # this line into `tg reply`, often days later and without the bracket, and a
     # bare id silently means a different message in another chat.
     name = "%s #%s" % (name, ref_str(ctx, cid, mid)) if mid is not None else name
+    if r.get("reply_to"):
+        name += " " + _reply_tag(ctx, r["reply_to"])
     txt = r.get("text")
     if txt:
         return "MSG %s%s: %s" % (prefix, name, txt.replace("\n", " / "))
@@ -1945,6 +2022,24 @@ def _print_transcript(t):
     print("\n%s\n%s" % (head, t.get("text") or ""))
 
 
+def _print_reply(ctx, rt):
+    frm = rt.get("from") or {}
+    who = frm.get("first_name") or "?"
+    if frm.get("username"):
+        who += " (@%s)" % frm["username"]
+    head = "↩ in reply to %s from %s" % (_reply_loc(ctx, rt), who)
+    if rt.get("date"):
+        head += "  %s" % _iso(rt["date"])
+    print(head)
+    if rt.get("quote"):
+        print('  quoting: "%s"' % " / ".join(rt["quote"].splitlines()))
+    med = rt.get("media")
+    if med:
+        print("  media: %s%s" % (med.get("type", "media"), _dur(med.get("duration"))))
+    for ln in (rt.get("text") or "").splitlines():
+        print("  > %s" % ln)
+
+
 def _show_message(ctx, r, transcripts):
     chat = r.get("chat") or {}
     cid = chat.get("id")
@@ -1963,6 +2058,8 @@ def _show_message(ctx, r, transcripts):
     if r.get("edited"):
         hdr += "  (edited)"
     print(hdr)
+    if r.get("reply_to"):
+        _print_reply(ctx, r["reply_to"])
     med = r.get("media")
     if med:
         print("media: %s%s  %s" % (med.get("type", "media"), _dur(med.get("duration")),
