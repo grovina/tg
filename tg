@@ -1036,7 +1036,7 @@ def tts(ctx, text, out_path):
     voice = ctx.get("TG_ELEVENLABS_VOICE_ID")
     if not voice:
         raise RuntimeError("TG_ELEVENLABS_VOICE_ID unset — pick a voice id (.env / tg.conf)")
-    model = ctx.get("TG_ELEVENLABS_TTS_MODEL") or "eleven_multilingual_v2"
+    model = ctx.get("TG_ELEVENLABS_TTS_MODEL") or "eleven_v4"
     body = json.dumps({"text": text, "model_id": model}).encode()
     audio = _http("https://api.elevenlabs.io/v1/text-to-speech/%s" % voice,
                   data=body, headers={"xi-api-key": _eleven_key(ctx),
